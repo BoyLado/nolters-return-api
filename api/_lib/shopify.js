@@ -1,101 +1,35 @@
-const SHOPIFY_API_VERSION = "2026-07";
-
-let tokenCache = {
-  accessToken: null,
-  expiresAt: 0,
-};
-
-/**
- * Get and validate environment variables.
- */
-function getConfig() {
-  const required = [
-    "SHOPIFY_SHOP",
-    "SHOPIFY_CLIENT_ID",
-    "SHOPIFY_CLIENT_SECRET",
-  ];
-
-  for (const key of required) {
-    if (!process.env[key]) {
-      throw new Error(
-        `Missing environment variable: ${key}`
-      );
-    }
-  }
-
-  return {
-    shop: normalizeShop(process.env.SHOPIFY_SHOP),
-    clientId: process.env.SHOPIFY_CLIENT_ID,
-    clientSecret: process.env.SHOPIFY_CLIENT_SECRET,
-  };
-}
-
-/**
- * Shopify expects the store subdomain.
- *
- * Accepted:
- *   nolters
- *   nolters.myshopify.com
- *   https://nolters.myshopify.com
- *
- * Internally we normalize to:
- *   nolters.myshopify.com
- */
-function normalizeShop(value) {
-  let shop = String(value || "").trim();
-
-  shop = shop
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/.*$/, "")
-    .replace(/\.myshopify\.com$/i, "");
+async function getShopifyAccessToken() {
+  const shop = process.env.SHOPIFY_SHOP;
+  const clientId = process.env.SHOPIFY_CLIENT_ID;
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
 
   if (!shop) {
-    throw new Error("Invalid SHOPIFY_SHOP.");
+    throw new Error(
+      "Missing SHOPIFY_SHOP environment variable."
+    );
   }
 
-  return `${shop}.myshopify.com`;
-}
-
-/**
- * Get a Shopify Admin API access token.
- *
- * Client Credentials Grant:
- *
- * POST
- * https://STORE.myshopify.com/admin/oauth/access_token
- *
- * Tokens are valid for 24 hours.
- */
-export async function getShopifyAccessToken() {
-  const now = Date.now();
-
-  /**
-   * Reuse the existing token when possible.
-   *
-   * Refresh 5 minutes before expiration.
-   */
-  if (
-    tokenCache.accessToken &&
-    tokenCache.expiresAt >
-      now + 5 * 60 * 1000
-  ) {
-    return tokenCache.accessToken;
+  if (!clientId) {
+    throw new Error(
+      "Missing SHOPIFY_CLIENT_ID environment variable."
+    );
   }
 
-  const {
-    shop,
-    clientId,
-    clientSecret,
-  } = getConfig();
+  if (!clientSecret) {
+    throw new Error(
+      "Missing SHOPIFY_CLIENT_SECRET environment variable."
+    );
+  }
+
+  const shopDomain = `${shop}.myshopify.com`;
 
   const tokenUrl =
-    `https://${shop}/admin/oauth/access_token`;
+    `https://${shopDomain}/admin/oauth/access_token`;
 
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: clientId,
-    client_secret: clientSecret,
-  });
+  console.log(
+    "Requesting Shopify access token for:",
+    shopDomain
+  );
 
   const response = await fetch(tokenUrl, {
     method: "POST",
@@ -103,159 +37,65 @@ export async function getShopifyAccessToken() {
     headers: {
       "Content-Type":
         "application/x-www-form-urlencoded",
+      "Accept": "application/json"
     },
 
-    body: body.toString(),
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret
+    }).toString()
   });
 
-  let data;
+  const responseText = await response.text();
 
-  try {
-    data = await response.json();
-  } catch {
-    data = null;
-  }
-
-  if (
-    !response.ok ||
-    !data ||
-    !data.access_token
-  ) {
+  if (!response.ok) {
     console.error(
       "Shopify authentication failed:",
       {
         status: response.status,
-        error: data?.error,
-        error_description:
-          data?.error_description,
+        response: responseText
       }
     );
 
     throw new Error(
-      "Unable to authenticate with Shopify."
+      `Unable to authenticate with Shopify. HTTP ${response.status}`
     );
   }
 
-  const expiresIn =
-    Number(data.expires_in) || 86399;
-
-  tokenCache = {
-    accessToken: data.access_token,
-
-    /**
-     * Store slightly less than the actual
-     * expiration time.
-     */
-    expiresAt:
-      Date.now() +
-      expiresIn * 1000,
-  };
-
-  return tokenCache.accessToken;
-}
-
-/**
- * Execute a Shopify Admin GraphQL request.
- */
-export async function shopifyGraphQL(
-  query,
-  variables = {}
-) {
-  const { shop } = getConfig();
-
-  let accessToken =
-    await getShopifyAccessToken();
-
-  const graphqlUrl =
-    `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  async function makeRequest(token) {
-    return fetch(graphqlUrl, {
-      method: "POST",
-
-      headers: {
-        "Content-Type":
-          "application/json",
-
-        "X-Shopify-Access-Token":
-          token,
-      },
-
-      body: JSON.stringify({
-        query,
-        variables,
-      }),
-    });
-  }
-
-  let response =
-    await makeRequest(accessToken);
-
-  /**
-   * If Shopify says the token is unauthorized,
-   * clear our cached token and obtain a new one.
-   */
-  if (response.status === 401) {
-    tokenCache = {
-      accessToken: null,
-      expiresAt: 0,
-    };
-
-    accessToken =
-      await getShopifyAccessToken();
-
-    response =
-      await makeRequest(accessToken);
-  }
-
-  let payload;
+  let data;
 
   try {
-    payload = await response.json();
+    data = JSON.parse(responseText);
   } catch {
+    console.error(
+      "Shopify returned invalid JSON:",
+      responseText
+    );
+
     throw new Error(
-      "Shopify returned an invalid response."
+      "Shopify returned an invalid authentication response."
     );
   }
 
-  if (!response.ok) {
+  if (!data.access_token) {
     console.error(
-      "Shopify GraphQL HTTP error:",
+      "Shopify authentication response did not contain an access token:",
       {
-        status: response.status,
-        errors: payload?.errors,
+        scope: data.scope,
+        expires_in: data.expires_in,
+        error: data.error
       }
     );
 
     throw new Error(
-      "Shopify API request failed."
+      "Shopify did not return an access token."
     );
   }
 
-  if (
-    payload.errors &&
-    payload.errors.length > 0
-  ) {
-    console.error(
-      "Shopify GraphQL errors:",
-      payload.errors
-    );
-
-    throw new Error(
-      "Shopify GraphQL returned an error."
-    );
-  }
-
-  return payload.data;
-}
-
-/**
- * Export the normalized shop name.
- *
- * Useful for diagnostics and other modules.
- */
-export function getShopifyShop() {
-  return normalizeShop(
-    process.env.SHOPIFY_SHOP
+  console.log(
+    "Shopify access token obtained successfully."
   );
+
+  return data.access_token;
 }
