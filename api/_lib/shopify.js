@@ -1,34 +1,63 @@
-async function getShopifyAccessToken() {
-  const shop = process.env.SHOPIFY_SHOP;
-  const clientId = process.env.SHOPIFY_CLIENT_ID;
-  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+const API_VERSION = "2026-07";
 
-  if (!shop) {
+/**
+ * Get required environment variable.
+ */
+function getEnv(name) {
+  const value = process.env[name];
+
+  if (!value) {
     throw new Error(
-      "Missing SHOPIFY_SHOP environment variable."
+      `Missing ${name} environment variable.`
     );
   }
 
-  if (!clientId) {
-    throw new Error(
-      "Missing SHOPIFY_CLIENT_ID environment variable."
-    );
+  return value.trim();
+}
+
+/**
+ * Get Shopify shop domain.
+ *
+ * Supported:
+ * SHOPIFY_SHOP=nolters
+ * SHOPIFY_SHOP=nolters.myshopify.com
+ * SHOPIFY_SHOP=https://nolters.myshopify.com
+ */
+function getShopDomain() {
+  let shop = getEnv("SHOPIFY_SHOP");
+
+  shop = shop
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+
+  if (!shop.includes(".")) {
+    shop = `${shop}.myshopify.com`;
   }
 
-  if (!clientSecret) {
-    throw new Error(
-      "Missing SHOPIFY_CLIENT_SECRET environment variable."
-    );
-  }
+  return shop;
+}
 
-  const shopDomain = `${shop}.myshopify.com`;
+/**
+ * Get Shopify Admin API access token
+ * using the client credentials grant.
+ */
+export async function getShopifyAccessToken() {
+  const shop = getShopDomain();
+
+  const clientId = getEnv(
+    "SHOPIFY_CLIENT_ID"
+  );
+
+  const clientSecret = getEnv(
+    "SHOPIFY_CLIENT_SECRET"
+  );
 
   const tokenUrl =
-    `https://${shopDomain}/admin/oauth/access_token`;
+    `https://${shop}/admin/oauth/access_token`;
 
   console.log(
     "Requesting Shopify access token for:",
-    shopDomain
+    shop
   );
 
   const response = await fetch(tokenUrl, {
@@ -47,7 +76,8 @@ async function getShopifyAccessToken() {
     }).toString()
   });
 
-  const responseText = await response.text();
+  const responseText =
+    await response.text();
 
   if (!response.ok) {
     console.error(
@@ -80,12 +110,7 @@ async function getShopifyAccessToken() {
 
   if (!data.access_token) {
     console.error(
-      "Shopify authentication response did not contain an access token:",
-      {
-        scope: data.scope,
-        expires_in: data.expires_in,
-        error: data.error
-      }
+      "Shopify authentication response did not contain an access token."
     );
 
     throw new Error(
@@ -98,4 +123,97 @@ async function getShopifyAccessToken() {
   );
 
   return data.access_token;
+}
+
+/**
+ * Execute Shopify Admin GraphQL request.
+ */
+export async function shopifyGraphQL(
+  query,
+  variables = {}
+) {
+  const shop = getShopDomain();
+
+  const accessToken =
+    await getShopifyAccessToken();
+
+  const graphqlUrl =
+    `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+
+  const response = await fetch(
+    graphqlUrl,
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Shopify-Access-Token":
+          accessToken
+      },
+
+      body: JSON.stringify({
+        query,
+        variables
+      })
+    }
+  );
+
+  const responseText =
+    await response.text();
+
+  if (!response.ok) {
+    console.error(
+      "Shopify GraphQL HTTP error:",
+      {
+        status: response.status,
+        response: responseText
+      }
+    );
+
+    throw new Error(
+      `Shopify GraphQL request failed. HTTP ${response.status}`
+    );
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error(
+      "Shopify GraphQL returned invalid JSON:",
+      responseText
+    );
+
+    throw new Error(
+      "Shopify GraphQL returned invalid JSON."
+    );
+  }
+
+  /**
+   * GraphQL can return HTTP 200 while still
+   * containing GraphQL errors.
+   */
+  if (
+    Array.isArray(data.errors) &&
+    data.errors.length > 0
+  ) {
+    console.error(
+      "Shopify GraphQL errors:",
+      data.errors
+    );
+
+    throw new Error(
+      data.errors
+        .map(
+          (error) =>
+            error.message ||
+            "Unknown Shopify GraphQL error."
+        )
+        .join("; ")
+    );
+  }
+
+  return data.data;
 }
