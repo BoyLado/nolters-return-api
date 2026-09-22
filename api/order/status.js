@@ -1,5 +1,8 @@
 import { shopifyGraphQL } from "../_lib/shopify.js";
 import { verifyAppProxyRequest } from "../_lib/app-proxy.js";
+import { Resend } from "resend";
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 /**
  * Send JSON response
@@ -101,6 +104,11 @@ const ORDER_STATUS_QUERY = `
         displayFinancialStatus
         displayFulfillmentStatus
         returnStatus
+        customer {
+          firstName
+          lastName
+          email
+        }
         totalPriceSet {
           shopMoney {
             amount
@@ -159,13 +167,6 @@ async function findOrder(orderNumber, email) {
 
 /**
  * Returnable fulfillments query.
- *
- * IMPORTANT: This query includes `lineItem { id }` inside
- * `fulfillmentLineItem` so we can build a mapping from
- * LineItem.id → FulfillmentLineItem.id.
- *
- * Also includes `remainingQuantity` so we know how many
- * units are still returnable.
  */
 const RETURNABLE_FULFILLMENTS_QUERY = `
   query ReturnableFulfillments($orderId: ID!) {
@@ -235,10 +236,28 @@ const RETURN_CREATE_MUTATION = `
   }
 `;
 
+/**
+ * Return approve mutation — triggers customer notification
+ */
+const RETURN_APPROVE_MUTATION = `
+  mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
+    returnApproveRequest(input: $input) {
+      return {
+        id
+        name
+        status
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 async function createShopifyReturn(orderId, returnLineItems) {
   const input = {
     orderId,
-    notifyCustomer: true,
     returnLineItems: returnLineItems.map((item) => ({
       fulfillmentLineItemId: item.fulfillmentLineItemId,
       quantity: item.quantity,
@@ -247,18 +266,167 @@ async function createShopifyReturn(orderId, returnLineItems) {
     })),
   };
 
-  const data = await shopifyGraphQL(RETURN_CREATE_MUTATION, {
+  // Step 1: Create the return
+  const createData = await shopifyGraphQL(RETURN_CREATE_MUTATION, {
     returnInput: input,
   });
 
-  const payload = data?.returnCreate;
-  const userErrors = payload?.userErrors || [];
+  const createPayload = createData?.returnCreate;
+  const createErrors = createPayload?.userErrors || [];
 
-  if (userErrors.length > 0) {
-    return { ok: false, errors: userErrors };
+  if (createErrors.length > 0) {
+    return { ok: false, errors: createErrors };
   }
 
-  return { ok: true, returnData: payload?.return };
+  const returnId = createPayload?.return?.id;
+  if (!returnId) {
+    return {
+      ok: false,
+      errors: [{ message: "Return created but no ID returned." }],
+    };
+  }
+
+  // Step 2: Approve + notify customer
+  const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
+    input: {
+      id: returnId,
+      notifyCustomer: true,
+    },
+  });
+
+  const approvePayload = approveData?.returnApproveRequest;
+  const approveErrors = approvePayload?.userErrors || [];
+
+  if (approveErrors.length > 0) {
+    console.warn("Return approved but notify failed:", approveErrors);
+    return { ok: true, returnData: createPayload?.return };
+  }
+
+  return {
+    ok: true,
+    returnData: approvePayload?.return || createPayload?.return,
+  };
+}
+
+/**
+ * Send merchant notification email via Resend
+ */
+async function sendMerchantNotification({ order, returnData, items }) {
+  const merchantEmail = process.env.MERCHANT_EMAIL;
+  const fromEmail = process.env.FROM_EMAIL;
+  const storeName = process.env.STORE_NAME || "Store";
+  const adminUrl = process.env.STORE_ADMIN_URL || "";
+
+  if (!merchantEmail || !fromEmail || !process.env.RESEND_API_KEY) {
+    console.warn("Merchant notification skipped — missing env vars.");
+    return { skipped: true };
+  }
+
+  const orderId = String(order.id || "").split("/").pop();
+  const orderLink = adminUrl ? `${adminUrl}/orders/${orderId}` : "";
+  const returnName = returnData?.name || "Return";
+
+  const itemsHtml = items
+    .map(
+      (i) => `
+        <tr>
+          <td style="padding:8px;border-bottom:1px solid #eee;">
+            ${i.title || ""}
+          </td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">
+            ${i.quantity}
+          </td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">
+            ${i.reason || ""}
+          </td>
+        </tr>`
+    )
+    .join("");
+
+  const customerName =
+    [order.customer?.firstName, order.customer?.lastName]
+      .filter(Boolean)
+      .join(" ") || "Customer";
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
+      <h2 style="margin:0 0 16px;">New return request</h2>
+      <p>A customer has submitted a return request for <strong>${storeName}</strong>.</p>
+
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
+        <tr>
+          <td style="padding:8px;background:#f5f5f5;width:160px;"><strong>Order</strong></td>
+          <td style="padding:8px;">${order.name || ""}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;background:#f5f5f5;"><strong>Return</strong></td>
+          <td style="padding:8px;">${returnName}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;background:#f5f5f5;"><strong>Customer</strong></td>
+          <td style="padding:8px;">${customerName} &lt;${order.email || ""}&gt;</td>
+        </tr>
+      </table>
+
+      <h3 style="margin:24px 0 8px;font-size:16px;">Items</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="background:#f5f5f5;">
+            <th style="padding:8px;text-align:left;">Item</th>
+            <th style="padding:8px;text-align:center;">Qty</th>
+            <th style="padding:8px;text-align:left;">Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${itemsHtml}
+        </tbody>
+      </table>
+
+      ${
+        orderLink
+          ? `<p style="margin-top:24px;">
+              <a href="${orderLink}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
+                View in Shopify Admin
+              </a>
+            </p>`
+          : ""
+      }
+
+      <p style="margin-top:24px;font-size:12px;color:#888;">
+        This is an automated notification from ${storeName}.
+      </p>
+    </div>
+  `;
+
+  const text = `
+New return request
+
+Order: ${order.name}
+Return: ${returnName}
+Customer: ${customerName} <${order.email}>
+
+Items:
+${items.map((i) => `- ${i.title} (Qty ${i.quantity}) — ${i.reason}`).join("\n")}
+
+${orderLink ? `View: ${orderLink}` : ""}
+  `.trim();
+
+  try {
+    const result = await resend.emails.send({
+      from: `${storeName} <${fromEmail}>`,
+      to: merchantEmail,
+      replyTo: order.email || undefined,
+      subject: `New return request — ${order.name} (${returnName})`,
+      html,
+      text,
+    });
+
+    console.log("Merchant notification sent:", result?.data?.id || result);
+    return { ok: true, id: result?.data?.id };
+  } catch (err) {
+    console.error("Resend send failed:", err);
+    return { ok: false, error: err.message };
+  }
 }
 
 /**
@@ -278,7 +446,7 @@ function serializeOrder(order) {
         }
       : null,
     items: (order.lineItems?.nodes || []).map((item) => ({
-      id: item.id,   // LineItem ID — this is what frontend sends back
+      id: item.id,
       title: item.name,
       quantity: item.quantity,
       image: item.image
@@ -311,10 +479,16 @@ async function handleLookup(res, body) {
   const email = normalizeEmail(body.email);
 
   if (!orderNumber || !email) {
-    return sendJson(res, 400, { ok: false, error: "Order number and email are required." });
+    return sendJson(res, 400, {
+      ok: false,
+      error: "Order number and email are required.",
+    });
   }
   if (!isValidEmail(email)) {
-    return sendJson(res, 400, { ok: false, error: "Please enter a valid email address." });
+    return sendJson(res, 400, {
+      ok: false,
+      error: "Please enter a valid email address.",
+    });
   }
   if (orderNumber.length > 50) {
     return sendJson(res, 400, { ok: false, error: "Invalid order number." });
@@ -332,7 +506,7 @@ async function handleLookup(res, body) {
 }
 
 /**
- * SUBMIT — create Shopify return
+ * SUBMIT — create Shopify return + notify merchant
  */
 async function handleSubmit(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
@@ -340,19 +514,25 @@ async function handleSubmit(res, body) {
   const items = Array.isArray(body.items) ? body.items : [];
 
   if (!orderNumber || !email) {
-    return sendJson(res, 400, { ok: false, error: "Order number and email are required." });
+    return sendJson(res, 400, {
+      ok: false,
+      error: "Order number and email are required.",
+    });
   }
   if (!items.length) {
-    return sendJson(res, 400, { ok: false, error: "At least one item is required." });
+    return sendJson(res, 400, {
+      ok: false,
+      error: "At least one item is required.",
+    });
   }
 
-  // 1. Find the order
+  // 1. Find order
   const order = await findOrder(orderNumber, email);
   if (!order) {
     return sendJson(res, 404, { ok: false, error: "Order not found." });
   }
 
-  // 2. Get returnable fulfillment line items (with mapping)
+  // 2. Get returnable items
   let returnable;
   try {
     returnable = await getReturnableFulfillmentLineItems(order.id);
@@ -371,16 +551,15 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // Debug log — helpful kapag may mismatch pa
   console.log("RETURNABLE ITEMS:", JSON.stringify(returnable, null, 2));
   console.log("REQUESTED ITEMS:", JSON.stringify(items, null, 2));
 
-  // 3. Match LineItem.id → FulfillmentLineItem
+  // 3. Match by LineItem.id
   const returnLineItems = [];
 
   for (const requestedItem of items) {
     const match = returnable.find(
-      (r) => r.lineItemId === requestedItem.item_id   // ← FIXED: match by lineItemId
+      (r) => r.lineItemId === requestedItem.item_id
     );
 
     if (!match) {
@@ -409,7 +588,7 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // 4. Create the return
+  // 4. Create return (+ approve + notify customer)
   let result;
   try {
     result = await createShopifyReturn(order.id, returnLineItems);
@@ -429,6 +608,18 @@ async function handleSubmit(res, body) {
   }
 
   console.log("Return created successfully:", result.returnData);
+
+  // 5. Notify merchant via Resend (non-blocking — failure won't break the return)
+  try {
+    await sendMerchantNotification({
+      order,
+      returnData: result.returnData,
+      items,
+    });
+  } catch (err) {
+    console.error("Merchant notification error:", err);
+    // Hindi ito fatal — successful pa rin ang return
+  }
 
   return sendJson(res, 200, {
     ok: true,

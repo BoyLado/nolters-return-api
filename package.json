@@ -2,5 +2,8 @@
   "name": "nolters-judgeme-api",
   "version": "1.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "resend": "^6.28.1"
+  }
 }
