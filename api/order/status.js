@@ -12,16 +12,10 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-/**
- * Normalize email
- */
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
-/**
- * Normalize order number
- */
 function normalizeOrderNumber(value) {
   let orderNumber = String(value || "").trim().replace(/\s+/g, "");
   if (orderNumber && !orderNumber.startsWith("#")) {
@@ -30,23 +24,17 @@ function normalizeOrderNumber(value) {
   return orderNumber;
 }
 
-/**
- * Basic email validation
- */
 function isValidEmail(email) {
   if (!email || email.length > 254) return false;
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-/**
- * Escape Shopify search values
- */
 function escapeSearchValue(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 /**
- * Map frontend reason strings to Shopify ReturnReason enum values.
+ * Map frontend reason strings to Shopify ReturnReason enum
  */
 function mapReturnReason(reason) {
   const normalized = String(reason || "").trim().toLowerCase();
@@ -57,16 +45,6 @@ function mapReturnReason(reason) {
     "changed my mind": "UNWANTED",
     "damaged / defective": "DEFECTIVE",
     "wrong item received": "WRONG_ITEM",
-    "other": "OTHER",
-    // Fallbacks for direct enum values
-    "size_too_small": "SIZE_TOO_SMALL",
-    "size_too_large": "SIZE_TOO_LARGE",
-    "color": "COLOR",
-    "defective": "DEFECTIVE",
-    "not_as_described": "NOT_AS_DESCRIBED",
-    "style": "STYLE",
-    "unwanted": "UNWANTED",
-    "wrong_item": "WRONG_ITEM",
     "other": "OTHER",
   };
 
@@ -105,7 +83,7 @@ async function readBody(req) {
 }
 
 /**
- * Shopify Admin GraphQL query
+ * Order lookup query
  */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
@@ -162,29 +140,32 @@ const ORDER_STATUS_QUERY = `
   }
 `;
 
-/**
- * Find order by email + exact order number
- */
 async function findOrder(orderNumber, email) {
   const query = `email:"${escapeSearchValue(email)}"`;
   const data = await shopifyGraphQL(ORDER_STATUS_QUERY, { query });
   const orders = data?.orders?.nodes || [];
 
-  const matchedOrder = orders.find((order) => {
-    const shopifyOrderNumber = String(order.name || "").trim();
-    const shopifyEmail = normalizeEmail(order.email);
-    return (
-      shopifyOrderNumber === orderNumber &&
-      shopifyEmail === email
-    );
-  });
-
-  return matchedOrder || null;
+  return (
+    orders.find((order) => {
+      const shopifyOrderNumber = String(order.name || "").trim();
+      const shopifyEmail = normalizeEmail(order.email);
+      return (
+        shopifyOrderNumber === orderNumber &&
+        shopifyEmail === email
+      );
+    }) || null
+  );
 }
 
 /**
- * Get returnable fulfillment line items for an order.
- * Returns an array of { fulfillmentLineItemId, quantity } objects.
+ * Returnable fulfillments query.
+ *
+ * IMPORTANT: This query includes `lineItem { id }` inside
+ * `fulfillmentLineItem` so we can build a mapping from
+ * LineItem.id → FulfillmentLineItem.id.
+ *
+ * Also includes `remainingQuantity` so we know how many
+ * units are still returnable.
  */
 const RETURNABLE_FULFILLMENTS_QUERY = `
   query ReturnableFulfillments($orderId: ID!) {
@@ -195,10 +176,13 @@ const RETURNABLE_FULFILLMENTS_QUERY = `
           returnableFulfillmentLineItems(first: 50) {
             edges {
               node {
+                quantity
                 fulfillmentLineItem {
                   id
+                  lineItem {
+                    id
+                  }
                 }
-                quantity
               }
             }
           }
@@ -217,9 +201,11 @@ async function getReturnableFulfillmentLineItems(orderId) {
     const items = edge.node?.returnableFulfillmentLineItems?.edges || [];
     items.forEach((itemEdge) => {
       const item = itemEdge.node;
-      if (item?.fulfillmentLineItem?.id) {
+      const fli = item?.fulfillmentLineItem;
+      if (fli?.id && fli?.lineItem?.id) {
         lineItems.push({
-          fulfillmentLineItemId: item.fulfillmentLineItem.id,
+          fulfillmentLineItemId: fli.id,
+          lineItemId: fli.lineItem.id,
           availableQuantity: item.quantity,
         });
       }
@@ -230,8 +216,7 @@ async function getReturnableFulfillmentLineItems(orderId) {
 }
 
 /**
- * Create a return in Shopify.
- * Returns { ok, returnData, errors }.
+ * Return create mutation
  */
 const RETURN_CREATE_MUTATION = `
   mutation ReturnCreate($returnInput: ReturnInput!) {
@@ -277,7 +262,7 @@ async function createShopifyReturn(orderId, returnLineItems) {
 }
 
 /**
- * Convert Shopify order into a safe public response.
+ * Serialize order for frontend
  */
 function serializeOrder(order) {
   return {
@@ -293,14 +278,11 @@ function serializeOrder(order) {
         }
       : null,
     items: (order.lineItems?.nodes || []).map((item) => ({
-      id: item.id,
+      id: item.id,   // LineItem ID — this is what frontend sends back
       title: item.name,
       quantity: item.quantity,
       image: item.image
-        ? {
-            url: item.image.url,
-            alt: item.image.altText || null,
-          }
+        ? { url: item.image.url, alt: item.image.altText || null }
         : null,
       unitPrice: item.originalUnitPriceSet?.shopMoney
         ? {
@@ -310,47 +292,35 @@ function serializeOrder(order) {
         : null,
       fulfillmentStatus: item.fulfillmentStatus,
     })),
-    returns: (order.returns?.nodes || []).map((returnItem) => ({
-      id: returnItem.id,
-      name: returnItem.name,
-      status: returnItem.status,
-      createdAt: returnItem.createdAt,
-      requestApprovedAt: returnItem.requestApprovedAt,
-      closedAt: returnItem.closedAt,
+    returns: (order.returns?.nodes || []).map((r) => ({
+      id: r.id,
+      name: r.name,
+      status: r.status,
+      createdAt: r.createdAt,
+      requestApprovedAt: r.requestApprovedAt,
+      closedAt: r.closedAt,
     })),
   };
 }
 
 /**
- * Handle "lookup" intent
+ * LOOKUP
  */
 async function handleLookup(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
   const email = normalizeEmail(body.email);
 
   if (!orderNumber || !email) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Order number and email are required.",
-    });
+    return sendJson(res, 400, { ok: false, error: "Order number and email are required." });
   }
-
   if (!isValidEmail(email)) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Please enter a valid email address.",
-    });
+    return sendJson(res, 400, { ok: false, error: "Please enter a valid email address." });
   }
-
   if (orderNumber.length > 50) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Invalid order number.",
-    });
+    return sendJson(res, 400, { ok: false, error: "Invalid order number." });
   }
 
   const order = await findOrder(orderNumber, email);
-
   if (!order) {
     return sendJson(res, 404, {
       ok: false,
@@ -358,14 +328,11 @@ async function handleLookup(res, body) {
     });
   }
 
-  return sendJson(res, 200, {
-    ok: true,
-    order: serializeOrder(order),
-  });
+  return sendJson(res, 200, { ok: true, order: serializeOrder(order) });
 }
 
 /**
- * Handle "submit" intent — create Shopify return
+ * SUBMIT — create Shopify return
  */
 async function handleSubmit(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
@@ -373,33 +340,22 @@ async function handleSubmit(res, body) {
   const items = Array.isArray(body.items) ? body.items : [];
 
   if (!orderNumber || !email) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Order number and email are required.",
-    });
+    return sendJson(res, 400, { ok: false, error: "Order number and email are required." });
   }
-
   if (!items.length) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "At least one item is required.",
-    });
+    return sendJson(res, 400, { ok: false, error: "At least one item is required." });
   }
 
-  // 1. Find the order to get its Shopify ID
+  // 1. Find the order
   const order = await findOrder(orderNumber, email);
-
   if (!order) {
-    return sendJson(res, 404, {
-      ok: false,
-      error: "Order not found. Please check your details.",
-    });
+    return sendJson(res, 404, { ok: false, error: "Order not found." });
   }
 
-  // 2. Get returnable fulfillment line items for this order
-  let returnableLineItems;
+  // 2. Get returnable fulfillment line items (with mapping)
+  let returnable;
   try {
-    returnableLineItems = await getReturnableFulfillmentLineItems(order.id);
+    returnable = await getReturnableFulfillmentLineItems(order.id);
   } catch (err) {
     console.error("Failed to fetch returnable fulfillments:", err);
     return sendJson(res, 500, {
@@ -408,22 +364,32 @@ async function handleSubmit(res, body) {
     });
   }
 
-  if (!returnableLineItems.length) {
+  if (!returnable.length) {
     return sendJson(res, 400, {
       ok: false,
       error: "This order has no items eligible for return.",
     });
   }
 
-  // 3. Build return line items by matching requested items to returnable fulfillment items
+  // Debug log — helpful kapag may mismatch pa
+  console.log("RETURNABLE ITEMS:", JSON.stringify(returnable, null, 2));
+  console.log("REQUESTED ITEMS:", JSON.stringify(items, null, 2));
+
+  // 3. Match LineItem.id → FulfillmentLineItem
   const returnLineItems = [];
 
   for (const requestedItem of items) {
-    const returnable = returnableLineItems.find(
-      (r) => r.fulfillmentLineItemId === requestedItem.item_id
+    const match = returnable.find(
+      (r) => r.lineItemId === requestedItem.item_id   // ← FIXED: match by lineItemId
     );
 
-    if (!returnable) {
+    if (!match) {
+      console.warn(
+        "No returnable match for item_id:",
+        requestedItem.item_id,
+        "| Title:",
+        requestedItem.title
+      );
       return sendJson(res, 400, {
         ok: false,
         error: `Item "${requestedItem.title || requestedItem.item_id}" is not eligible for return.`,
@@ -432,18 +398,18 @@ async function handleSubmit(res, body) {
 
     const qty = Math.min(
       Number(requestedItem.quantity) || 1,
-      returnable.availableQuantity
+      match.availableQuantity
     );
 
     returnLineItems.push({
-      fulfillmentLineItemId: returnable.fulfillmentLineItemId,
+      fulfillmentLineItemId: match.fulfillmentLineItemId,
       quantity: qty,
       returnReason: mapReturnReason(requestedItem.reason),
       returnReasonNote: "",
     });
   }
 
-  // 4. Create the return in Shopify
+  // 4. Create the return
   let result;
   try {
     result = await createShopifyReturn(order.id, returnLineItems);
@@ -459,13 +425,9 @@ async function handleSubmit(res, body) {
     const errorMsg =
       result.errors?.[0]?.message || "Failed to create return in Shopify.";
     console.error("Return userErrors:", result.errors);
-    return sendJson(res, 400, {
-      ok: false,
-      error: errorMsg,
-    });
+    return sendJson(res, 400, { ok: false, error: errorMsg });
   }
 
-  // 5. Success — Shopify automatically sends email to customer
   console.log("Return created successfully:", result.returnData);
 
   return sendJson(res, 200, {
@@ -477,25 +439,19 @@ async function handleSubmit(res, body) {
 }
 
 /**
- * Main API handler
+ * Main handler
  */
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
-      return sendJson(res, 405, {
-        ok: false,
-        error: "Method not allowed.",
-      });
+      return sendJson(res, 405, { ok: false, error: "Method not allowed." });
     }
 
     const proxy = verifyAppProxyRequest(req);
     if (!proxy.valid) {
       console.warn("Invalid App Proxy request:", proxy.reason);
-      return sendJson(res, 401, {
-        ok: false,
-        error: "Unauthorized.",
-      });
+      return sendJson(res, 401, { ok: false, error: "Unauthorized." });
     }
 
     const body = await readBody(req);
