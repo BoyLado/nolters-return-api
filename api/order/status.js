@@ -87,6 +87,10 @@ async function readBody(req) {
 
 /**
  * Order lookup query
+ *
+ * NOTE: `customer { ... }` block was REMOVED because it required
+ * the `read_customers` scope which is not granted to this app.
+ * Order.email is sufficient for our notification needs.
  */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
@@ -104,11 +108,6 @@ const ORDER_STATUS_QUERY = `
         displayFinancialStatus
         displayFulfillmentStatus
         returnStatus
-        customer {
-          firstName
-          lastName
-          email
-        }
         totalPriceSet {
           shopMoney {
             amount
@@ -166,7 +165,7 @@ async function findOrder(orderNumber, email) {
 }
 
 /**
- * Returnable fulfillments query.
+ * Returnable fulfillments query
  */
 const RETURNABLE_FULFILLMENTS_QUERY = `
   query ReturnableFulfillments($orderId: ID!) {
@@ -312,6 +311,15 @@ async function createShopifyReturn(orderId, returnLineItems) {
  * Send merchant notification email via Resend
  */
 async function sendMerchantNotification({ order, returnData, items }) {
+  console.log("=== sendMerchantNotification START ===");
+  console.log("ENV CHECK:", {
+    hasResendKey: !!process.env.RESEND_API_KEY,
+    hasMerchantEmail: !!process.env.MERCHANT_EMAIL,
+    hasFromEmail: !!process.env.FROM_EMAIL,
+    merchantEmail: process.env.MERCHANT_EMAIL,
+    fromEmail: process.env.FROM_EMAIL,
+  });
+
   const merchantEmail = process.env.MERCHANT_EMAIL;
   const fromEmail = process.env.FROM_EMAIL;
   const storeName = process.env.STORE_NAME || "Store";
@@ -343,10 +351,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
     )
     .join("");
 
-  const customerName =
-    [order.customer?.firstName, order.customer?.lastName]
-      .filter(Boolean)
-      .join(" ") || "Customer";
+  const customerDisplay = order.email || "Customer";
 
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
@@ -364,7 +369,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
         </tr>
         <tr>
           <td style="padding:8px;background:#f5f5f5;"><strong>Customer</strong></td>
-          <td style="padding:8px;">${customerName} &lt;${order.email || ""}&gt;</td>
+          <td style="padding:8px;">${customerDisplay}</td>
         </tr>
       </table>
 
@@ -403,7 +408,7 @@ New return request
 
 Order: ${order.name}
 Return: ${returnName}
-Customer: ${customerName} <${order.email}>
+Customer: ${order.email}
 
 Items:
 ${items.map((i) => `- ${i.title} (Qty ${i.quantity}) — ${i.reason}`).join("\n")}
@@ -412,6 +417,7 @@ ${orderLink ? `View: ${orderLink}` : ""}
   `.trim();
 
   try {
+    console.log("Calling Resend API...");
     const result = await resend.emails.send({
       from: `${storeName} <${fromEmail}>`,
       to: merchantEmail,
@@ -421,10 +427,18 @@ ${orderLink ? `View: ${orderLink}` : ""}
       text,
     });
 
-    console.log("Merchant notification sent:", result?.data?.id || result);
+    console.log("Resend API response:", JSON.stringify(result));
+
+    if (result?.error) {
+      console.error("Resend returned error:", result.error);
+      return { ok: false, error: result.error };
+    }
+
+    console.log("Merchant notification sent:", result?.data?.id);
     return { ok: true, id: result?.data?.id };
   } catch (err) {
     console.error("Resend send failed:", err);
+    console.error("Error stack:", err.stack);
     return { ok: false, error: err.message };
   }
 }
@@ -618,6 +632,7 @@ async function handleSubmit(res, body) {
     });
   } catch (err) {
     console.error("Merchant notification error:", err);
+    console.error("Merchant notification stack:", err.stack);
     // Hindi ito fatal — successful pa rin ang return
   }
 
