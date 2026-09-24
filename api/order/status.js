@@ -232,6 +232,9 @@ async function readBody(req) {
  * - Fulfillments with deliveredAt (for return window check)
  * - Existing returns
  *
+ * IMPORTANT: `fulfillments` is a direct array on Order type,
+ * NOT a connection. Do not use `nodes` or `edges` wrapper.
+ *
  * NOTE: `customer { ... }` block is NOT included because
  * the app only has `read_orders` scope, not `read_customers`.
  * Order.email is sufficient for our needs.
@@ -285,23 +288,21 @@ const ORDER_STATUS_QUERY = `
           }
         }
         fulfillments(first: 10) {
-          nodes {
-            id
-            status
-            deliveredAt
-            createdAt
-            trackingInfo {
-              number
-              url
-            }
-            fulfillmentLineItems(first: 50) {
-              edges {
-                node {
+          id
+          status
+          deliveredAt
+          createdAt
+          trackingInfo {
+            number
+            url
+          }
+          fulfillmentLineItems(first: 50) {
+            edges {
+              node {
+                id
+                quantity
+                lineItem {
                   id
-                  quantity
-                  lineItem {
-                    id
-                  }
                 }
               }
             }
@@ -503,10 +504,13 @@ async function getReturnableFulfillmentLineItems(orderId) {
  * Used for:
  * - 7-day return window check
  * - 48-hour damage report window check
+ *
+ * IMPORTANT: `order.fulfillments` is a direct array,
+ * NOT a connection. Do not use `.nodes` or `.edges`.
  */
 function buildDeliveryMap(order) {
   const map = new Map();
-  (order.fulfillments?.nodes || []).forEach((f) => {
+  (order.fulfillments || []).forEach((f) => {
     if (!f.deliveredAt) return;
     (f.fulfillmentLineItems?.edges || []).forEach((edge) => {
       map.set(edge.node.lineItem.id, f.deliveredAt);
