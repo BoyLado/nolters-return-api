@@ -2,10 +2,19 @@
 
 export default async function handler(req, res) {
   console.log("=== CALLBACK ENDPOINT HIT ===");
-  console.log("Query params:", JSON.stringify(req.query));
+  console.log("Request URL:", req.url);
+  console.log("Request method:", req.method);
+  console.log("Request headers:", JSON.stringify(req.headers));
 
   try {
-    const { code, shop } = req.query;
+    // Parse query params manually from URL (works in both Node.js and Edge)
+    const url = new URL(req.url, `https://${req.headers.host || "nolters-return-api.vercel.app"}`);
+    const code = url.searchParams.get("code");
+    const shop = url.searchParams.get("shop");
+
+    console.log("Parsed URL:", url.toString());
+    console.log("code:", code);
+    console.log("shop:", shop);
 
     if (!code || !shop) {
       console.error("Missing code or shop parameter");
@@ -21,21 +30,13 @@ export default async function handler(req, res) {
 
     const clientId = process.env.SHOPIFY_CLIENT_ID;
     const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
-    const expectedShop = (process.env.SHOPIFY_SHOP || "").replace(/\.myshopify\.com$/i, "");
 
     console.log("Client ID present:", !!clientId);
     console.log("Client Secret present:", !!clientSecret);
-    console.log("Expected shop:", expectedShop);
 
     if (!clientId || !clientSecret) {
       console.error("Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET");
       return res.status(500).send("Server configuration error: missing credentials.");
-    }
-
-    // Verify shop matches expected shop
-    if (expectedShop && !shopDomain.startsWith(expectedShop.toLowerCase())) {
-      console.warn("Shop mismatch. Expected:", expectedShop, "Got:", shopDomain);
-      // Don't block — just log a warning
     }
 
     const tokenUrl = `https://${shopDomain}/admin/oauth/access_token`;
@@ -59,17 +60,11 @@ export default async function handler(req, res) {
     console.log("Shopify response content-type:", response.headers.get("content-type"));
 
     const responseText = await response.text();
-
-    // Log first 500 chars of response for debugging
     console.log("Shopify response body (first 500 chars):", responseText.substring(0, 500));
 
     // Check if response is HTML (error page)
     if (responseText.trim().startsWith("<!DOCTYPE") || responseText.trim().startsWith("<html")) {
       console.error("Shopify returned HTML instead of JSON");
-      console.error("This usually means:");
-      console.error("  - The shop domain is invalid");
-      console.error("  - The app is not installed on this store");
-      console.error("  - The OAuth endpoint is incorrect");
       return res.status(500).send(
         "Shopify returned an HTML error page instead of JSON. " +
         "Check that the shop domain is correct and the app is installed."
