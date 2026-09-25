@@ -1,37 +1,13 @@
+// File: api/_lib/shopify.js
+
 const API_VERSION = "2026-07";
 
 /**
  * Configuration constants
  */
-const TOKEN_CACHE_BUFFER_MS = 60 * 1000; // Refresh token 60s before expiry
 const FETCH_TIMEOUT_MS = 15000;           // 15 second timeout
 const MAX_RETRIES = 3;                    // Max retry attempts
 const RETRY_BASE_DELAY_MS = 1000;         // Base delay for exponential backoff
-
-/**
- * In-memory token cache
- *
- * Note: Sa Vercel serverless, ang bawat function instance ay
- * may sariling memory. Ang cache na ito ay valid lang sa
- * loob ng isang warm instance. Kung mag-cold start, kukuha
- * ulit ng bagong token — pero mas efficient pa rin kaysa
- * walang cache.
- */
-let tokenCache = {
-  accessToken: null,
-  expiresAt: 0,
-  shop: null,
-};
-
-/**
- * In-flight token request promise
- *
- * Ito ay para sa concurrent request safety — kung may
- * dalawang requests na sabay na kailangan ng token,
- * hindi sila mag-doble ng fetch. Ang pangalawa ay
- * maghihintay sa pangalawang promise.
- */
-let tokenPromise = null;
 
 /**
  * Get required environment variable.
@@ -68,11 +44,6 @@ function getShopDomain() {
 
 /**
  * Fetch with timeout support.
- *
- * Ang native fetch ay walang timeout, kaya pwedeng mag-hang
- * ang Vercel function kung ang Shopify ay slow. Ito ay
- * gumagamit ng AbortController para i-cancel ang request
- * pagkatapos ng specified timeout.
  */
 async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -96,13 +67,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
 
 /**
  * Fetch with retry logic.
- *
- * Retries on:
- * - 429 (rate limit)
- * - 500, 502, 503, 504 (server errors)
- * - Network errors (fetch throws)
- *
- * Uses exponential backoff: 1s, 2s, 4s
  */
 async function fetchWithRetry(url, options = {}, maxRetries = MAX_RETRIES) {
   let lastError = null;
@@ -150,110 +114,22 @@ async function fetchWithRetry(url, options = {}, maxRetries = MAX_RETRIES) {
 }
 
 /**
- * Get Shopify Admin API access token using the
- * client credentials grant.
+ * Get Shopify Admin API access token.
  *
- * Features:
- * - In-memory caching (valid until expiry)
- * - Concurrent request safety (avoids duplicate fetches)
- * - Auto-refresh 60s before expiry
+ * For your single-store setup, this is the offline token
+ * you obtained via OAuth and stored in Vercel as
+ * SHOPIFY_ADMIN_ACCESS_TOKEN.
  */
 export async function getShopifyAccessToken() {
-  const shop = getShopDomain();
-  const now = Date.now();
-
-  // Return cached token if valid
-  if (
-    tokenCache.accessToken &&
-    tokenCache.shop === shop &&
-    now < tokenCache.expiresAt
-  ) {
-    console.log("Using cached Shopify access token.");
-    return tokenCache.accessToken;
-  }
-
-  // If a token fetch is already in progress, wait for it
-  if (tokenPromise) {
-    console.log("Waiting for in-flight token request...");
-    return tokenPromise;
-  }
-
-  // Start a new token fetch
-  tokenPromise = (async () => {
-    try {
-      const clientId = getEnv("SHOPIFY_CLIENT_ID");
-      const clientSecret = getEnv("SHOPIFY_CLIENT_SECRET");
-      const tokenUrl = `https://${shop}/admin/oauth/access_token`;
-
-      console.log("Requesting new Shopify access token for:", shop);
-
-      const response = await fetchWithRetry(tokenUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-        body: new URLSearchParams({
-          grant_type: "client_credentials",
-          client_id: clientId,
-          client_secret: clientSecret,
-        }).toString(),
-      });
-
-      const responseText = await response.text();
-
-      if (!response.ok) {
-        console.error("Shopify authentication failed:", {
-          status: response.status,
-          response: responseText,
-        });
-        throw new Error(
-          `Unable to authenticate with Shopify. HTTP ${response.status}`
-        );
-      }
-
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch {
-        console.error("Shopify returned invalid JSON:", responseText);
-        throw new Error("Shopify returned an invalid authentication response.");
-      }
-
-      if (!data.access_token) {
-        console.error(
-          "Shopify authentication response did not contain an access token."
-        );
-        throw new Error("Shopify did not return an access token.");
-      }
-
-      // Cache the token
-      const expiresIn = Number(data.expires_in) || 86399; // Default 24h
-      tokenCache = {
-        accessToken: data.access_token,
-        expiresAt: now + expiresIn * 1000 - TOKEN_CACHE_BUFFER_MS,
-        shop,
-      };
-
-      console.log(
-        `Shopify access token obtained. Expires in ${expiresIn}s.`
-      );
-
-      return data.access_token;
-    } finally {
-      // Clear the in-flight promise regardless of success/failure
-      tokenPromise = null;
-    }
-  })();
-
-  return tokenPromise;
+  const token = getEnv("SHOPIFY_ADMIN_ACCESS_TOKEN");
+  return token;
 }
 
 /**
  * Execute Shopify Admin GraphQL request.
  *
  * Features:
- * - Automatic token management (cached)
+ * - Uses static offline token from env
  * - Retry on transient errors
  * - Timeout protection
  * - Query cost logging
@@ -294,13 +170,7 @@ export async function shopifyGraphQL(query, variables = {}) {
     throw new Error("Shopify GraphQL returned invalid JSON.");
   }
 
-  /**
-   * Log query cost (for monitoring query complexity).
-   *
-   * Ang Shopify ay may 1000-point limit per query.
-   * Kung ang cost ay malapit na sa limit, kailangan
-   * nating i-optimize ang query.
-   */
+  // Query cost logging
   const cost = data?.extensions?.cost;
   if (cost) {
     const { requestedQueryCost, actualQueryCost, throttleStatus } = cost;
@@ -311,7 +181,6 @@ export async function shopifyGraphQL(query, variables = {}) {
       restoreRate: throttleStatus?.restoreRate,
     });
 
-    // Warn if we're using a lot of the budget
     if (actualQueryCost && actualQueryCost > 500) {
       console.warn(
         `High query cost detected: ${actualQueryCost}. ` +
@@ -320,14 +189,10 @@ export async function shopifyGraphQL(query, variables = {}) {
     }
   }
 
-  /**
-   * GraphQL can return HTTP 200 while still
-   * containing GraphQL errors.
-   */
+  // GraphQL-level errors (HTTP 200 but errors present)
   if (Array.isArray(data.errors) && data.errors.length > 0) {
     console.error("Shopify GraphQL errors:", data.errors);
 
-    // Check for throttling errors specifically
     const isThrottled = data.errors.some((err) =>
       String(err.message || "").toLowerCase().includes("throttl")
     );
@@ -346,13 +211,4 @@ export async function shopifyGraphQL(query, variables = {}) {
   }
 
   return data.data;
-}
-
-/**
- * Clear the token cache (for testing or manual reset).
- */
-export function clearTokenCache() {
-  tokenCache = { accessToken: null, expiresAt: 0, shop: null };
-  tokenPromise = null;
-  console.log("Token cache cleared.");
 }
