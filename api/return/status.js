@@ -133,6 +133,9 @@ function mapReturnReason(reason) {
 
 /**
  * Check if an item is within the 7-day return window.
+ *
+ * @param {string|null} deliveredAt - ISO date string of delivery
+ * @returns {boolean}
  */
 function isWithinReturnWindow(deliveredAt) {
   if (!deliveredAt) return false;
@@ -145,6 +148,9 @@ function isWithinReturnWindow(deliveredAt) {
 
 /**
  * Check if an item is within the 48-hour damage report window.
+ *
+ * @param {string|null} deliveredAt - ISO date string of delivery
+ * @returns {boolean}
  */
 function isWithinDamageWindow(deliveredAt) {
   if (!deliveredAt) return false;
@@ -159,6 +165,9 @@ function isWithinDamageWindow(deliveredAt) {
  * Check if an item is final sale based on:
  * - Product tags (e.g., "final-sale", "engraved")
  * - Custom attributes (e.g., "Engraving", "Personalization")
+ *
+ * @param {object} item - Shopify line item
+ * @returns {boolean}
  */
 function isFinalSaleItem(item) {
   // Check product tags
@@ -220,8 +229,7 @@ async function readBody(req) {
  * Includes:
  * - Order basics (name, email, dates, status)
  * - Line items with images, prices, tags, customAttributes
- * - Fulfillments with deliveredAt, tracking info (for order status + return window)
- * - Shipping address (for order status page)
+ * - Fulfillments with deliveredAt (for return window check)
  * - Existing returns
  *
  * IMPORTANT: `fulfillments` is a direct array on Order type,
@@ -252,17 +260,6 @@ const ORDER_STATUS_QUERY = `
             amount
             currencyCode
           }
-        }
-        shippingAddress {
-          firstName
-          lastName
-          address1
-          address2
-          city
-          province
-          country
-          zip
-          phone
         }
         lineItems(first: 50) {
           nodes {
@@ -295,11 +292,9 @@ const ORDER_STATUS_QUERY = `
           status
           deliveredAt
           createdAt
-          updatedAt
           trackingInfo {
             number
             url
-            company
           }
           fulfillmentLineItems(first: 50) {
             edges {
@@ -330,6 +325,10 @@ const ORDER_STATUS_QUERY = `
 
 /**
  * Returnable fulfillments query.
+ *
+ * Includes:
+ * - Line item name and image (for return items page)
+ * - Fulfillment line item ID (for returnCreate mutation)
  */
 const RETURNABLE_FULFILLMENTS_QUERY = `
   query ReturnableFulfillments($orderId: ID!) {
@@ -414,6 +413,16 @@ const RETURN_APPROVE_MUTATION = `
  * Find order by order number AND email.
  *
  * Requirement: Both orderNumber and email must match for security.
+ *
+ * Strategy:
+ * 1. Query Shopify by `name` (order number) — specific and fast.
+ * 2. Verify the email matches manually.
+ * 3. Return the order only if both match.
+ *
+ * Why query by `name` instead of `email`?
+ * - The `orders` query has a 60-day limit and returns max 250 results.
+ * - If a customer has many orders, the specific order might not be in the results.
+ * - Querying by `name` is more precise and reliable.
  */
 async function findOrder(orderNumber, email) {
   const query = `name:"${escapeSearchValue(orderNumber)}"`;
@@ -449,6 +458,15 @@ async function findOrder(orderNumber, email) {
 
 /**
  * Get returnable fulfillment line items for an order.
+ *
+ * Returns array of:
+ * {
+ *   fulfillmentLineItemId: string,
+ *   lineItemId: string,
+ *   availableQuantity: number,
+ *   title: string,
+ *   image: { url, alt } | null
+ * }
  */
 async function getReturnableFulfillmentLineItems(orderId) {
   const data = await shopifyGraphQL(RETURNABLE_FULFILLMENTS_QUERY, { orderId });
@@ -481,15 +499,11 @@ async function getReturnableFulfillmentLineItems(orderId) {
 }
 
 /**
- * Build a map of lineItemId → delivery date.
+ * Build a map of lineItemId → deliveredAt timestamp.
  *
- * Fallback logic:
- * 1. Use `deliveredAt` if available (most accurate).
- * 2. Otherwise, use `updatedAt` of the fulfillment (assumes delivered).
- * 3. Otherwise, use `createdAt` of the fulfillment (last resort).
- *
- * This ensures items are returnable even if the carrier hasn't
- * updated the deliveredAt timestamp yet.
+ * Used for:
+ * - 7-day return window check
+ * - 48-hour damage report window check
  *
  * IMPORTANT: `order.fulfillments` is a direct array,
  * NOT a connection. Do not use `.nodes` or `.edges`.
@@ -497,20 +511,9 @@ async function getReturnableFulfillmentLineItems(orderId) {
 function buildDeliveryMap(order) {
   const map = new Map();
   (order.fulfillments || []).forEach((f) => {
-    // Skip cancelled or errored fulfillments
-    if (f.status === "CANCELLED" || f.status === "ERROR") return;
-
-    // Determine the best delivery date
-    const deliveryDate =
-      f.deliveredAt ||
-      f.updatedAt ||
-      f.createdAt ||
-      null;
-
-    if (!deliveryDate) return;
-
+    if (!f.deliveredAt) return;
     (f.fulfillmentLineItems?.edges || []).forEach((edge) => {
-      map.set(edge.node.lineItem.id, deliveryDate);
+      map.set(edge.node.lineItem.id, f.deliveredAt);
     });
   });
   return map;
@@ -518,6 +521,13 @@ function buildDeliveryMap(order) {
 
 /**
  * Create a Shopify return and auto-approve it.
+ *
+ * Since eligible items are already filtered by the 7-day window
+ * (and 48-hour damage window) before reaching this function,
+ * we can safely auto-approve all returns here.
+ *
+ * The customer will receive Shopify's native return confirmation
+ * email (configured in Shopify Admin → Notifications).
  */
 async function createShopifyReturn(orderId, returnLineItems) {
   const input = {
@@ -564,6 +574,9 @@ async function createShopifyReturn(orderId, returnLineItems) {
   const approveErrors = approvePayload?.userErrors || [];
 
   if (approveErrors.length > 0) {
+    // Return was created successfully, but approval failed.
+    // Log the error, but don't fail the whole request.
+    // The merchant can manually approve in Shopify Admin.
     console.warn("Return created but auto-approve failed:", approveErrors);
     return {
       ok: true,
@@ -589,6 +602,10 @@ async function createShopifyReturn(orderId, returnLineItems) {
 
 /**
  * Send merchant notification email via Resend.
+ *
+ * This is for awareness only — the return has already been
+ * auto-approved. The merchant will still need to inspect the
+ * returned item and issue the refund manually.
  */
 async function sendMerchantNotification({ order, returnData, items }) {
   console.log("=== sendMerchantNotification START ===");
@@ -735,11 +752,14 @@ ${orderLink ? `View: ${orderLink}` : ""}
  */
 
 /**
- * Serialize order for the RETURNS page.
+ * Serialize order for frontend.
  *
- * Adds eligibility markers per item.
+ * Adds eligibility markers per item:
+ * - withinWindow: within 7-day return window
+ * - withinDamageWindow: within 48-hour damage report window
+ * - finalSale: is a final sale item
  */
-function serializeOrderForReturns(order) {
+function serializeOrder(order) {
   const deliveryMap = buildDeliveryMap(order);
 
   return {
@@ -793,87 +813,13 @@ function serializeOrderForReturns(order) {
 }
 
 /**
- * Serialize order for the ORDER STATUS page.
- *
- * Adds:
- * - shippingAddress
- * - fulfillments (with tracking info)
- */
-function serializeOrderForTracking(order) {
-  return {
-    number: order.name,
-    email: order.email,
-    createdAt: order.createdAt,
-    financialStatus: order.displayFinancialStatus,
-    fulfillmentStatus: order.displayFulfillmentStatus,
-    returnStatus: order.returnStatus,
-    total: order.totalPriceSet?.shopMoney
-      ? {
-          amount: order.totalPriceSet.shopMoney.amount,
-          currency: order.totalPriceSet.shopMoney.currencyCode,
-        }
-      : null,
-    shippingAddress: order.shippingAddress
-      ? {
-          firstName: order.shippingAddress.firstName || "",
-          lastName: order.shippingAddress.lastName || "",
-          address1: order.shippingAddress.address1 || "",
-          address2: order.shippingAddress.address2 || "",
-          city: order.shippingAddress.city || "",
-          province: order.shippingAddress.province || "",
-          country: order.shippingAddress.country || "",
-          zip: order.shippingAddress.zip || "",
-          phone: order.shippingAddress.phone || "",
-        }
-      : null,
-    items: (order.lineItems?.nodes || []).map((item) => ({
-      id: item.id,
-      title: item.name,
-      quantity: item.quantity,
-      image: item.image
-        ? { url: item.image.url, alt: item.image.altText || null }
-        : null,
-      unitPrice: item.originalUnitPriceSet?.shopMoney
-        ? {
-            amount: item.originalUnitPriceSet.shopMoney.amount,
-            currency: item.originalUnitPriceSet.shopMoney.currencyCode,
-          }
-        : null,
-      fulfillmentStatus: item.fulfillmentStatus,
-    })),
-    fulfillments: (order.fulfillments || []).map((f) => ({
-      id: f.id,
-      status: f.status,
-      deliveredAt: f.deliveredAt || null,
-      createdAt: f.createdAt || null,
-      updatedAt: f.updatedAt || null,
-      trackingInfo: f.trackingInfo
-        ? {
-            number: f.trackingInfo.number || null,
-            url: f.trackingInfo.url || null,
-            company: f.trackingInfo.company || null,
-          }
-        : null,
-    })),
-    returns: (order.returns?.nodes || []).map((r) => ({
-      id: r.id,
-      name: r.name,
-      status: r.status,
-      createdAt: r.createdAt,
-      requestApprovedAt: r.requestApprovedAt,
-      closedAt: r.closedAt,
-    })),
-  };
-}
-
-/**
  * ============================================================
  * REQUEST HANDLERS
  * ============================================================
  */
 
 /**
- * HANDLE LOOKUP — for Returns page.
+ * LOOKUP — find order by order number + email.
  *
  * Returns order details with eligibility markers per item.
  */
@@ -920,7 +866,7 @@ async function handleLookup(res, body) {
     // Continue — lahat ng items ay hindi eligible kung may error
   }
 
-  const serialized = serializeOrderForReturns(order);
+  const serialized = serializeOrder(order);
 
   // Mark eligibility per item
   serialized.items = serialized.items.map((item) => ({
@@ -935,52 +881,10 @@ async function handleLookup(res, body) {
 }
 
 /**
- * HANDLE TRACK — for Order Status page.
+ * SUBMIT — create Shopify return + auto-approve + notify merchant.
  *
- * Returns order details with shipping address and fulfillments.
- * No eligibility filtering — ipapakita lahat ng items.
- */
-async function handleTrack(res, body) {
-  const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
-  const email = normalizeEmail(body.email);
-
-  // Validate inputs
-  if (!orderNumber || !email) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Order number and email are required.",
-    });
-  }
-  if (!isValidEmail(email)) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Please enter a valid email address.",
-    });
-  }
-  if (orderNumber.length > 50) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Invalid order number.",
-    });
-  }
-
-  // Find order (both order number and email must match)
-  const order = await findOrder(orderNumber, email);
-  if (!order) {
-    return sendJson(res, 404, {
-      ok: false,
-      error: "We couldn't find an order matching those details.",
-    });
-  }
-
-  return sendJson(res, 200, {
-    ok: true,
-    order: serializeOrderForTracking(order),
-  });
-}
-
-/**
- * HANDLE SUBMIT — create Shopify return + auto-approve + notify merchant.
+ * Eligibility is double-checked here even though the frontend
+ * only shows eligible items, to prevent bypassing the policy.
  */
 async function handleSubmit(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
@@ -1007,7 +911,7 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // Step 1: Find order
+  // Step 1: Find order (both order number and email must match)
   const order = await findOrder(orderNumber, email);
   if (!order) {
     return sendJson(res, 404, {
@@ -1123,6 +1027,7 @@ async function handleSubmit(res, body) {
     });
   } catch (err) {
     console.error("Merchant notification error:", err);
+    // Hindi fatal — successful pa rin ang return
   }
 
   // Step 6: Respond to customer
@@ -1167,10 +1072,6 @@ export default async function handler(req, res) {
     // Route to handler
     if (intent === "submit") {
       return await handleSubmit(res, body);
-    }
-
-    if (intent === "track") {
-      return await handleTrack(res, body);
     }
 
     return await handleLookup(res, body);
