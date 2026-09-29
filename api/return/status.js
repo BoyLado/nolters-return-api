@@ -79,12 +79,6 @@ function normalizeEmail(email) {
 
 /**
  * Normalize order number: trim, remove spaces, add # prefix.
- *
- * Examples:
- *   "4153"    → "#4153"
- *   "#4153"   → "#4153"
- *   "# 4153"  → "#4153"
- *   " 4153 "  → "#4153"
  */
 function normalizeOrderNumber(value) {
   let orderNumber = String(value || "").trim().replace(/\s+/g, "");
@@ -110,10 +104,19 @@ function escapeSearchValue(value) {
 }
 
 /**
+ * Escape HTML entities for safe email rendering.
+ */
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
  * Map frontend reason strings to Shopify ReturnReason enum.
- *
- * IMPORTANT: Shopify only accepts specific enum values.
- * Custom strings will be rejected by the API.
  */
 function mapReturnReason(reason) {
   const normalized = String(reason || "").trim().toLowerCase();
@@ -133,9 +136,6 @@ function mapReturnReason(reason) {
 
 /**
  * Check if an item is within the 7-day return window.
- *
- * @param {string|null} deliveredAt - ISO date string of delivery
- * @returns {boolean}
  */
 function isWithinReturnWindow(deliveredAt) {
   if (!deliveredAt) return false;
@@ -148,9 +148,6 @@ function isWithinReturnWindow(deliveredAt) {
 
 /**
  * Check if an item is within the 48-hour damage report window.
- *
- * @param {string|null} deliveredAt - ISO date string of delivery
- * @returns {boolean}
  */
 function isWithinDamageWindow(deliveredAt) {
   if (!deliveredAt) return false;
@@ -162,21 +159,14 @@ function isWithinDamageWindow(deliveredAt) {
 }
 
 /**
- * Check if an item is final sale based on:
- * - Product tags (e.g., "final-sale", "engraved")
- * - Custom attributes (e.g., "Engraving", "Personalization")
- *
- * @param {object} item - Shopify line item
- * @returns {boolean}
+ * Check if an item is final sale based on tags or custom attributes.
  */
 function isFinalSaleItem(item) {
-  // Check product tags
   const tags = (item.product?.tags || []).map((t) => String(t).toLowerCase());
   const hasFinalSaleTag = tags.some((tag) =>
     FINAL_SALE_TAGS.some((fs) => tag.includes(fs))
   );
 
-  // Check custom attributes
   const attrs = item.customAttributes || [];
   const hasCustomAttr = attrs.some((attr) => {
     const key = String(attr.key || "").toLowerCase();
@@ -225,19 +215,6 @@ async function readBody(req) {
 
 /**
  * Order lookup query.
- *
- * Includes:
- * - Order basics (name, email, dates, status)
- * - Line items with images, prices, tags, customAttributes
- * - Fulfillments with deliveredAt (for return window check)
- * - Existing returns
- *
- * IMPORTANT: `fulfillments` is a direct array on Order type,
- * NOT a connection. Do not use `nodes` or `edges` wrapper.
- *
- * NOTE: `customer { ... }` block is NOT included because
- * the app only has `read_orders` scope, not `read_customers`.
- * Order.email is sufficient for our needs.
  */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
@@ -325,10 +302,6 @@ const ORDER_STATUS_QUERY = `
 
 /**
  * Returnable fulfillments query.
- *
- * Includes:
- * - Line item name and image (for return items page)
- * - Fulfillment line item ID (for returnCreate mutation)
  */
 const RETURNABLE_FULFILLMENTS_QUERY = `
   query ReturnableFulfillments($orderId: ID!) {
@@ -361,11 +334,11 @@ const RETURNABLE_FULFILLMENTS_QUERY = `
 `;
 
 /**
- * Return create mutation.
+ * Return request mutation.
  */
-const RETURN_CREATE_MUTATION = `
-  mutation ReturnCreate($returnInput: ReturnInput!) {
-    returnCreate(returnInput: $returnInput) {
+const RETURN_REQUEST_MUTATION = `
+  mutation ReturnRequest($input: ReturnRequestInput!) {
+    returnRequest(input: $input) {
       return {
         id
         name
@@ -381,11 +354,7 @@ const RETURN_CREATE_MUTATION = `
 `;
 
 /**
- * Return approve mutation — triggers customer notification.
- *
- * NOTE: Auto-approve is the default behavior for eligible returns
- * (within 7-day window, not final sale, not outside 48h damage window).
- * The eligibility is already checked before this mutation is called.
+ * Return approve request mutation.
  */
 const RETURN_APPROVE_MUTATION = `
   mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
@@ -411,25 +380,12 @@ const RETURN_APPROVE_MUTATION = `
 
 /**
  * Find order by order number AND email.
- *
- * Requirement: Both orderNumber and email must match for security.
- *
- * Strategy:
- * 1. Query Shopify by `name` (order number) — specific and fast.
- * 2. Verify the email matches manually.
- * 3. Return the order only if both match.
- *
- * Why query by `name` instead of `email`?
- * - The `orders` query has a 60-day limit and returns max 250 results.
- * - If a customer has many orders, the specific order might not be in the results.
- * - Querying by `name` is more precise and reliable.
  */
 async function findOrder(orderNumber, email) {
   const query = `name:"${escapeSearchValue(orderNumber)}"`;
   const data = await shopifyGraphQL(ORDER_STATUS_QUERY, { query });
   const orders = data?.orders?.nodes || [];
 
-  // Find order with matching order number AND email
   const order = orders.find((o) => {
     const shopifyOrderNumber = String(o.name || "").trim();
     const shopifyEmail = normalizeEmail(o.email);
@@ -446,9 +402,7 @@ async function findOrder(orderNumber, email) {
       "| Email:",
       email,
       "| Orders found by name:",
-      orders.length,
-      "| Emails found:",
-      orders.map((o) => normalizeEmail(o.email)).join(", ")
+      orders.length
     );
     return null;
   }
@@ -458,15 +412,6 @@ async function findOrder(orderNumber, email) {
 
 /**
  * Get returnable fulfillment line items for an order.
- *
- * Returns array of:
- * {
- *   fulfillmentLineItemId: string,
- *   lineItemId: string,
- *   availableQuantity: number,
- *   title: string,
- *   image: { url, alt } | null
- * }
  */
 async function getReturnableFulfillmentLineItems(orderId) {
   const data = await shopifyGraphQL(RETURNABLE_FULFILLMENTS_QUERY, { orderId });
@@ -500,13 +445,6 @@ async function getReturnableFulfillmentLineItems(orderId) {
 
 /**
  * Build a map of lineItemId → deliveredAt timestamp.
- *
- * Used for:
- * - 7-day return window check
- * - 48-hour damage report window check
- *
- * IMPORTANT: `order.fulfillments` is a direct array,
- * NOT a connection. Do not use `.nodes` or `.edges`.
  */
 function buildDeliveryMap(order) {
   const map = new Map();
@@ -520,52 +458,48 @@ function buildDeliveryMap(order) {
 }
 
 /**
- * Create a Shopify return and auto-approve it.
- *
- * Since eligible items are already filtered by the 7-day window
- * (and 48-hour damage window) before reaching this function,
- * we can safely auto-approve all returns here.
- *
- * The customer will receive Shopify's native return confirmation
- * email (configured in Shopify Admin → Notifications).
+ * Creates a return request and approves it, triggering Shopify's native notification.
  */
-async function createShopifyReturn(orderId, returnLineItems) {
-  const input = {
+async function createAndApproveReturn(orderId, returnLineItems) {
+  const requestInput = {
     orderId,
     returnLineItems: returnLineItems.map((item) => ({
       fulfillmentLineItemId: item.fulfillmentLineItemId,
       quantity: item.quantity,
       returnReason: item.returnReason,
-      returnReasonNote: item.returnReasonNote || "",
+      customerNote: item.customerNote || "",
     })),
   };
 
-  // Step 1: Create the return
-  const createData = await shopifyGraphQL(RETURN_CREATE_MUTATION, {
-    returnInput: input,
+  console.log("Creating return request...");
+  const requestData = await shopifyGraphQL(RETURN_REQUEST_MUTATION, {
+    input: requestInput,
   });
 
-  const createPayload = createData?.returnCreate;
-  const createErrors = createPayload?.userErrors || [];
+  const requestPayload = requestData?.returnRequest;
+  const requestErrors = requestPayload?.userErrors || [];
 
-  if (createErrors.length > 0) {
-    return { ok: false, errors: createErrors };
+  if (requestErrors.length > 0) {
+    console.error("returnRequest userErrors:", requestErrors);
+    return { ok: false, errors: requestErrors };
   }
 
-  const returnId = createPayload?.return?.id;
-  if (!returnId) {
+  const returnData = requestPayload?.return;
+  if (!returnData?.id) {
     return {
       ok: false,
-      errors: [{ message: "Return created but no ID returned." }],
+      errors: [{ message: "Return request created but no ID returned." }],
     };
   }
 
-  // Step 2: Auto-approve + notify customer
-  console.log("Auto-approving return and notifying customer...");
+  console.log(
+    `Return request created — id: ${returnData.id}, name: ${returnData.name}, status: ${returnData.status}`
+  );
 
+  console.log("Approving return request and notifying customer...");
   const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
     input: {
-      id: returnId,
+      id: returnData.id,
       notifyCustomer: true,
     },
   });
@@ -574,38 +508,36 @@ async function createShopifyReturn(orderId, returnLineItems) {
   const approveErrors = approvePayload?.userErrors || [];
 
   if (approveErrors.length > 0) {
-    // Return was created successfully, but approval failed.
-    // Log the error, but don't fail the whole request.
-    // The merchant can manually approve in Shopify Admin.
-    console.warn("Return created but auto-approve failed:", approveErrors);
+    console.error(
+      "AUTO-APPROVE FAILED:",
+      JSON.stringify(approveErrors, null, 2)
+    );
     return {
       ok: true,
-      returnData: createPayload?.return,
+      returnData: returnData,
       autoApproved: false,
       approvalError: approveErrors[0]?.message || "Approval failed.",
     };
   }
 
-  console.log("Return auto-approved successfully.");
+  console.log("Return request approved and customer notified.");
   return {
     ok: true,
-    returnData: approvePayload?.return || createPayload?.return,
+    returnData: approvePayload?.return || returnData,
     autoApproved: true,
   };
 }
 
 /**
  * ============================================================
- * EMAIL NOTIFICATION
+ * EMAIL NOTIFICATIONS (Merchant only — customer handled by Shopify)
  * ============================================================
  */
 
 /**
  * Send merchant notification email via Resend.
  *
- * This is for awareness only — the return has already been
- * auto-approved. The merchant will still need to inspect the
- * returned item and issue the refund manually.
+ * Includes product image thumbnails and per-item customer notes.
  */
 async function sendMerchantNotification({ order, returnData, items }) {
   console.log("=== sendMerchantNotification START ===");
@@ -624,40 +556,62 @@ async function sendMerchantNotification({ order, returnData, items }) {
   const orderLink = adminUrl ? `${adminUrl}/orders/${orderId}` : "";
   const returnName = returnData?.name || "Return";
 
+  // Build items table with image thumbnails and notes.
+  // `i.note` is the normalized field name (mapped from frontend `details`).
   const itemsHtml = items
-    .map(
-      (i) => `
+    .map((i) => {
+      const imgUrl = i.image && i.image.url ? i.image.url : "";
+      const imgAlt = i.image && i.image.alt ? i.image.alt : (i.title || "");
+
+      const imgCell = imgUrl
+        ? `<img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(imgAlt)}"
+             width="48" height="48"
+             style="display:block;width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #eee;" />`
+        : `<div style="width:48px;height:48px;background:#f0f0f0;border-radius:4px;border:1px solid #eee;"></div>`;
+
+      return `
         <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.title || ""}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;">${i.quantity}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.reason || ""}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;">${i.note || "—"}</td>
-        </tr>`
-    )
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;width:56px;">
+            ${imgCell}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.title || "")}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;text-align:center;font-size:14px;">
+            ${escapeHtml(i.quantity)}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.reason || "")}
+          </td>
+          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
+            ${escapeHtml(i.note || "—")}
+          </td>
+        </tr>`;
+    })
     .join("");
 
   const customerDisplay = order.email || "Customer";
 
   const html = `
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#333;">
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;color:#333;">
       <h2 style="margin:0 0 16px;">New return request (auto-approved)</h2>
       <p>
-        A customer has submitted a return request for <strong>${storeName}</strong>.
-        The return has been <strong>automatically approved</strong> because it falls within the 7-day return window.
+        A customer has submitted a return request for <strong>${escapeHtml(storeName)}</strong>.
+        The return has been <strong>automatically approved</strong>.
       </p>
 
       <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
         <tr>
           <td style="padding:8px;background:#f5f5f5;width:160px;"><strong>Order</strong></td>
-          <td style="padding:8px;">${order.name || ""}</td>
+          <td style="padding:8px;">${escapeHtml(order.name || "")}</td>
         </tr>
         <tr>
           <td style="padding:8px;background:#f5f5f5;"><strong>Return</strong></td>
-          <td style="padding:8px;">${returnName}</td>
+          <td style="padding:8px;">${escapeHtml(returnName)}</td>
         </tr>
         <tr>
           <td style="padding:8px;background:#f5f5f5;"><strong>Customer</strong></td>
-          <td style="padding:8px;">${customerDisplay}</td>
+          <td style="padding:8px;">${escapeHtml(customerDisplay)}</td>
         </tr>
       </table>
 
@@ -665,6 +619,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       <table style="width:100%;border-collapse:collapse;font-size:14px;">
         <thead>
           <tr style="background:#f5f5f5;">
+            <th style="padding:8px;text-align:left;width:56px;"></th>
             <th style="padding:8px;text-align:left;">Item</th>
             <th style="padding:8px;text-align:center;">Qty</th>
             <th style="padding:8px;text-align:left;">Reason</th>
@@ -689,7 +644,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       ${
         orderLink
           ? `<p style="margin-top:24px;">
-              <a href="${orderLink}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
+              <a href="${escapeHtml(orderLink)}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
                 View in Shopify Admin
               </a>
             </p>`
@@ -697,7 +652,7 @@ async function sendMerchantNotification({ order, returnData, items }) {
       }
 
       <p style="margin-top:24px;font-size:12px;color:#888;">
-        This is an automated notification from ${storeName}.
+        This is an automated notification from ${escapeHtml(storeName)}.
       </p>
     </div>
   `;
@@ -751,14 +706,6 @@ ${orderLink ? `View: ${orderLink}` : ""}
  * ============================================================
  */
 
-/**
- * Serialize order for frontend.
- *
- * Adds eligibility markers per item:
- * - withinWindow: within 7-day return window
- * - withinDamageWindow: within 48-hour damage report window
- * - finalSale: is a final sale item
- */
 function serializeOrder(order) {
   const deliveryMap = buildDeliveryMap(order);
 
@@ -818,16 +765,10 @@ function serializeOrder(order) {
  * ============================================================
  */
 
-/**
- * LOOKUP — find order by order number + email.
- *
- * Returns order details with eligibility markers per item.
- */
 async function handleLookup(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
   const email = normalizeEmail(body.email);
 
-  // Validate inputs
   if (!orderNumber || !email) {
     return sendJson(res, 400, {
       ok: false,
@@ -847,7 +788,6 @@ async function handleLookup(res, body) {
     });
   }
 
-  // Find order (both order number and email must match)
   const order = await findOrder(orderNumber, email);
   if (!order) {
     return sendJson(res, 404, {
@@ -856,19 +796,16 @@ async function handleLookup(res, body) {
     });
   }
 
-  // Get returnable items from Shopify
   let returnableIds = new Set();
   try {
     const returnable = await getReturnableFulfillmentLineItems(order.id);
     returnable.forEach((r) => returnableIds.add(r.lineItemId));
   } catch (err) {
     console.error("Failed to fetch returnable items:", err);
-    // Continue — lahat ng items ay hindi eligible kung may error
   }
 
   const serialized = serializeOrder(order);
 
-  // Mark eligibility per item
   serialized.items = serialized.items.map((item) => ({
     ...item,
     eligible:
@@ -880,18 +817,11 @@ async function handleLookup(res, body) {
   return sendJson(res, 200, { ok: true, order: serialized });
 }
 
-/**
- * SUBMIT — create Shopify return + auto-approve + notify merchant.
- *
- * Eligibility is double-checked here even though the frontend
- * only shows eligible items, to prevent bypassing the policy.
- */
 async function handleSubmit(res, body) {
   const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
   const email = normalizeEmail(body.email);
   const items = Array.isArray(body.items) ? body.items : [];
 
-  // Validate inputs
   if (!orderNumber || !email) {
     return sendJson(res, 400, {
       ok: false,
@@ -911,7 +841,6 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // Step 1: Find order (both order number and email must match)
   const order = await findOrder(orderNumber, email);
   if (!order) {
     return sendJson(res, 404, {
@@ -920,7 +849,6 @@ async function handleSubmit(res, body) {
     });
   }
 
-  // Step 2: Get returnable items
   let returnable;
   try {
     returnable = await getReturnableFulfillmentLineItems(order.id);
@@ -940,9 +868,8 @@ async function handleSubmit(res, body) {
   }
 
   const deliveryMap = buildDeliveryMap(order);
-
-  // Step 3: Validate each requested item
   const returnLineItems = [];
+  const enrichedItems = [];
 
   for (const requestedItem of items) {
     const match = returnable.find(
@@ -950,21 +877,13 @@ async function handleSubmit(res, body) {
     );
 
     if (!match) {
-      console.warn(
-        "No returnable match for item_id:",
-        requestedItem.item_id,
-        "| Title:",
-        requestedItem.title
-      );
+      console.warn("No returnable match for item_id:", requestedItem.item_id);
       return sendJson(res, 400, {
         ok: false,
-        error: `Item "${
-          requestedItem.title || requestedItem.item_id
-        }" is not eligible for return.`,
+        error: `Item "${requestedItem.title || requestedItem.item_id}" is not eligible for return.`,
       });
     }
 
-    // Double-check return window
     const deliveredAt = deliveryMap.get(requestedItem.item_id) || null;
     const isDamaged =
       String(requestedItem.reason || "").toLowerCase().includes("damaged") ||
@@ -989,20 +908,32 @@ async function handleSubmit(res, body) {
       match.availableQuantity
     );
 
+    const noteText = (requestedItem.details || "").slice(0, 300);
+
     returnLineItems.push({
       fulfillmentLineItemId: match.fulfillmentLineItemId,
       quantity: qty,
       returnReason: mapReturnReason(requestedItem.reason),
-      returnReasonNote: requestedItem.note || "",
+      customerNote: noteText,
+    });
+
+    // Enrich the item with the image from Shopify and normalize
+    // the note field name (`details` → `note`) for the email template.
+    enrichedItems.push({
+      item_id: requestedItem.item_id,
+      title: requestedItem.title || match.title,
+      quantity: qty,
+      reason: requestedItem.reason,
+      note: noteText,
+      image: match.image || null,
     });
   }
 
-  // Step 4: Create return + auto-approve + notify customer
   let result;
   try {
-    result = await createShopifyReturn(order.id, returnLineItems);
+    result = await createAndApproveReturn(order.id, returnLineItems);
   } catch (err) {
-    console.error("returnCreate mutation failed:", err);
+    console.error("Return creation/approval failed:", err);
     return sendJson(res, 500, {
       ok: false,
       error: "An unexpected error occurred while creating the return.",
@@ -1018,19 +949,19 @@ async function handleSubmit(res, body) {
 
   console.log("Return created successfully:", result.returnData);
 
-  // Step 5: Notify merchant via Resend (non-blocking)
+  // Notify merchant via Resend (non-blocking)
+  // Uses enrichedItems so the email includes images and notes.
   try {
     await sendMerchantNotification({
       order,
       returnData: result.returnData,
-      items,
+      items: enrichedItems,
     });
   } catch (err) {
     console.error("Merchant notification error:", err);
-    // Hindi fatal — successful pa rin ang return
   }
 
-  // Step 6: Respond to customer
+  // Respond to customer
   return sendJson(res, 200, {
     ok: true,
     message: result.autoApproved
@@ -1050,26 +981,22 @@ async function handleSubmit(res, body) {
 
 export default async function handler(req, res) {
   try {
-    // Only allow POST
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
       return sendJson(res, 405, { ok: false, error: "Method not allowed." });
     }
 
-    // Verify App Proxy request
     const proxy = verifyAppProxyRequest(req);
     if (!proxy.valid) {
       console.warn("Invalid App Proxy request:", proxy.reason);
       return sendJson(res, 401, { ok: false, error: "Unauthorized." });
     }
 
-    // Parse body
     const body = await readBody(req);
     const intent = body.intent || "lookup";
 
     console.log("INTENT:", intent);
 
-    // Route to handler
     if (intent === "submit") {
       return await handleSubmit(res, body);
     }
