@@ -161,8 +161,17 @@ async function readBody(req) {
 /**
  * Order lookup query.
  *
- * Includes return line items so the customer can see what items
- * are in each existing return.
+ * IMPORTANT: `returns.returnLineItems` returns the `ReturnLineItemType`
+ * interface, NOT the concrete `ReturnLineItem` type. To access
+ * `fulfillmentLineItem`, we MUST use an inline fragment:
+ *
+ *   ... on ReturnLineItem { fulfillmentLineItem { ... } }
+ *
+ * Without the inline fragment, Shopify will reject the query with:
+ *   "Field 'fulfillmentLineItem' doesn't exist on type 'ReturnLineItemType'"
+ *
+ * @see https://shopify.dev/docs/api/admin-graphql/latest/interfaces/ReturnLineItemType
+ * @see https://community.shopify.com/t/how-do-i-query-order-returns-returnlineitems-when-it-is-returnlineitemtype-instead-of-returnlineitem/357341
  */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
@@ -243,20 +252,28 @@ const ORDER_STATUS_QUERY = `
             closedAt
             returnLineItems(first: 50) {
               nodes {
-                id
-                quantity
-                returnReason
-                returnReasonNote
-                fulfillmentLineItem {
+                ... on ReturnLineItem {
                   id
-                  lineItem {
+                  quantity
+                  returnReason
+                  returnReasonNote
+                  fulfillmentLineItem {
                     id
-                    name
-                    image {
-                      url
-                      altText
+                    lineItem {
+                      id
+                      name
+                      image {
+                        url
+                        altText
+                      }
                     }
                   }
+                }
+                ... on UnverifiedReturnLineItem {
+                  id
+                  quantity
+                  returnReason
+                  returnReasonNote
                 }
               }
             }
@@ -694,23 +711,28 @@ function serializeOrder(order) {
       createdAt: r.createdAt,
       requestApprovedAt: r.requestApprovedAt,
       closedAt: r.closedAt,
-      items: (r.returnLineItems?.nodes || []).map((li) => {
-        const fli = li.fulfillmentLineItem;
-        const lineItem = fli?.lineItem;
-        return {
-          id: li.id,
-          quantity: li.quantity,
-          returnReason: li.returnReason,
-          returnReasonNote: li.returnReasonNote || "",
-          title: lineItem?.name || "",
-          image: lineItem?.image
-            ? {
-                url: lineItem.image.url,
-                alt: lineItem.image.altText || null,
-              }
-            : null,
-        };
-      }),
+      items: (r.returnLineItems?.nodes || [])
+        .map((li) => {
+          // Only ReturnLineItem has fulfillmentLineItem.
+          // UnverifiedReturnLineItem has no fulfillmentLineItem.
+          const fli = li.fulfillmentLineItem;
+          if (!fli) return null;
+          const lineItem = fli?.lineItem;
+          return {
+            id: li.id,
+            quantity: li.quantity,
+            returnReason: li.returnReason,
+            returnReasonNote: li.returnReasonNote || "",
+            title: lineItem?.name || "",
+            image: lineItem?.image
+              ? {
+                  url: lineItem.image.url,
+                  alt: lineItem.image.altText || null,
+                }
+              : null,
+          };
+        })
+        .filter(Boolean),
     })),
   };
 }
