@@ -159,19 +159,14 @@ async function readBody(req) {
  */
 
 /**
- * Order lookup query.
+ * Order lookup query — LIGHTWEIGHT.
  *
- * IMPORTANT: `returns.returnLineItems` returns the `ReturnLineItemType`
- * interface, NOT the concrete `ReturnLineItem` type. To access
- * `fulfillmentLineItem`, we MUST use an inline fragment:
+ * IMPORTANT: This query does NOT include `returnLineItems`.
+ * Including it would push the query cost over the 1,000 limit
+ * because of too many nested connections with high `first` values.
  *
- *   ... on ReturnLineItem { fulfillmentLineItem { ... } }
- *
- * Without the inline fragment, Shopify will reject the query with:
- *   "Field 'fulfillmentLineItem' doesn't exist on type 'ReturnLineItemType'"
- *
- * @see https://shopify.dev/docs/api/admin-graphql/latest/interfaces/ReturnLineItemType
- * @see https://community.shopify.com/t/how-do-i-query-order-returns-returnlineitems-when-it-is-returnlineitemtype-instead-of-returnlineitem/357341
+ * Return line items are fetched separately via `RETURN_DETAILS_QUERY`
+ * (only when the order has existing returns).
  */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
@@ -250,33 +245,55 @@ const ORDER_STATUS_QUERY = `
             createdAt
             requestApprovedAt
             closedAt
-            returnLineItems(first: 50) {
-              nodes {
-                ... on ReturnLineItem {
-                  id
-                  quantity
-                  returnReason
-                  returnReasonNote
-                  fulfillmentLineItem {
-                    id
-                    lineItem {
-                      id
-                      name
-                      image {
-                        url
-                        altText
-                      }
-                    }
-                  }
-                }
-                ... on UnverifiedReturnLineItem {
-                  id
-                  quantity
-                  returnReason
-                  returnReasonNote
+          }
+        }
+      }
+    }
+  }
+`;
+
+/**
+ * Return details query — fetches a SINGLE return with its line items.
+ *
+ * IMPORTANT: `returnLineItems` returns the `ReturnLineItemType` interface,
+ * NOT the concrete `ReturnLineItem` type. To access `fulfillmentLineItem`,
+ * we MUST use an inline fragment.
+ *
+ * @see https://community.shopify.dev/t/shouldnt-the-returnlineitemtype-include-a-connection-to-the-lineitem/7502
+ */
+const RETURN_DETAILS_QUERY = `
+  query ReturnDetails($id: ID!) {
+    return(id: $id) {
+      id
+      name
+      status
+      createdAt
+      requestApprovedAt
+      closedAt
+      returnLineItems(first: 50) {
+        nodes {
+          ... on ReturnLineItem {
+            id
+            quantity
+            returnReason
+            returnReasonNote
+            fulfillmentLineItem {
+              id
+              lineItem {
+                id
+                name
+                image {
+                  url
+                  altText
                 }
               }
             }
+          }
+          ... on UnverifiedReturnLineItem {
+            id
+            quantity
+            returnReason
+            returnReasonNote
           }
         }
       }
@@ -380,6 +397,50 @@ async function findOrder(orderNumber, email) {
   }
 
   return order;
+}
+
+/**
+ * Fetch return line items for a single return.
+ * Called only when the order has existing returns.
+ */
+async function fetchReturnLineItems(returnId) {
+  try {
+    const data = await shopifyGraphQL(RETURN_DETAILS_QUERY, { id: returnId });
+    const ret = data?.return;
+    if (!ret) return null;
+
+    return {
+      id: ret.id,
+      name: ret.name,
+      status: ret.status,
+      createdAt: ret.createdAt,
+      requestApprovedAt: ret.requestApprovedAt,
+      closedAt: ret.closedAt,
+      items: (ret.returnLineItems?.nodes || [])
+        .map((li) => {
+          const fli = li.fulfillmentLineItem;
+          if (!fli) return null;
+          const lineItem = fli?.lineItem;
+          return {
+            id: li.id,
+            quantity: li.quantity,
+            returnReason: li.returnReason,
+            returnReasonNote: li.returnReasonNote || "",
+            title: lineItem?.name || "",
+            image: lineItem?.image
+              ? {
+                  url: lineItem.image.url,
+                  alt: lineItem.image.altText || null,
+                }
+              : null,
+          };
+        })
+        .filter(Boolean),
+    };
+  } catch (err) {
+    console.error("fetchReturnLineItems failed:", err);
+    return null;
+  }
 }
 
 async function getReturnableFulfillmentLineItems(orderId) {
@@ -662,8 +723,33 @@ ${orderLink ? `View: ${orderLink}` : ""}
  * ============================================================
  */
 
-function serializeOrder(order) {
+function serializeOrder(order, returnDetails) {
   const deliveryMap = buildDeliveryMap(order);
+
+  // Merge return details (line items) into the base returns array.
+  const baseReturns = (order.returns?.nodes || []).map((r) => ({
+    id: r.id,
+    name: r.name,
+    status: r.status,
+    createdAt: r.createdAt,
+    requestApprovedAt: r.requestApprovedAt,
+    closedAt: r.closedAt,
+    items: [],
+  }));
+
+  // If returnDetails array is provided, attach items to matching returns.
+  if (Array.isArray(returnDetails) && returnDetails.length) {
+    const detailsById = new Map();
+    returnDetails.forEach((d) => {
+      if (d && d.id) detailsById.set(d.id, d);
+    });
+    baseReturns.forEach((r) => {
+      const d = detailsById.get(r.id);
+      if (d && Array.isArray(d.items)) {
+        r.items = d.items;
+      }
+    });
+  }
 
   return {
     number: order.name,
@@ -704,36 +790,7 @@ function serializeOrder(order) {
         finalSale,
       };
     }),
-    returns: (order.returns?.nodes || []).map((r) => ({
-      id: r.id,
-      name: r.name,
-      status: r.status,
-      createdAt: r.createdAt,
-      requestApprovedAt: r.requestApprovedAt,
-      closedAt: r.closedAt,
-      items: (r.returnLineItems?.nodes || [])
-        .map((li) => {
-          // Only ReturnLineItem has fulfillmentLineItem.
-          // UnverifiedReturnLineItem has no fulfillmentLineItem.
-          const fli = li.fulfillmentLineItem;
-          if (!fli) return null;
-          const lineItem = fli?.lineItem;
-          return {
-            id: li.id,
-            quantity: li.quantity,
-            returnReason: li.returnReason,
-            returnReasonNote: li.returnReasonNote || "",
-            title: lineItem?.name || "",
-            image: lineItem?.image
-              ? {
-                  url: lineItem.image.url,
-                  alt: lineItem.image.altText || null,
-                }
-              : null,
-          };
-        })
-        .filter(Boolean),
-    })),
+    returns: baseReturns,
   };
 }
 
@@ -782,7 +839,19 @@ async function handleLookup(res, body) {
     console.error("Failed to fetch returnable items:", err);
   }
 
-  const serialized = serializeOrder(order);
+  // Fetch return line items ONLY if there are existing returns.
+  // This is a separate query to keep the main order query cost under 1,000.
+  let returnDetails = [];
+  const existingReturns = order.returns?.nodes || [];
+  if (existingReturns.length > 0) {
+    // Fetch details for each return in parallel.
+    const detailsResults = await Promise.all(
+      existingReturns.map((r) => fetchReturnLineItems(r.id))
+    );
+    returnDetails = detailsResults.filter(Boolean);
+  }
+
+  const serialized = serializeOrder(order, returnDetails);
 
   serialized.items = serialized.items.map((item) => ({
     ...item,
