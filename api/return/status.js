@@ -158,6 +158,12 @@ async function readBody(req) {
  * ============================================================
  */
 
+/**
+ * Order lookup query.
+ *
+ * Includes return line items so the customer can see what items
+ * are in each existing return.
+ */
 const ORDER_STATUS_QUERY = `
   query OrderStatus($query: String!) {
     orders(
@@ -235,6 +241,25 @@ const ORDER_STATUS_QUERY = `
             createdAt
             requestApprovedAt
             closedAt
+            returnLineItems(first: 50) {
+              nodes {
+                id
+                quantity
+                returnReason
+                returnReasonNote
+                fulfillmentLineItem {
+                  id
+                  lineItem {
+                    id
+                    name
+                    image {
+                      url
+                      altText
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -669,6 +694,23 @@ function serializeOrder(order) {
       createdAt: r.createdAt,
       requestApprovedAt: r.requestApprovedAt,
       closedAt: r.closedAt,
+      items: (r.returnLineItems?.nodes || []).map((li) => {
+        const fli = li.fulfillmentLineItem;
+        const lineItem = fli?.lineItem;
+        return {
+          id: li.id,
+          quantity: li.quantity,
+          returnReason: li.returnReason,
+          returnReasonNote: li.returnReasonNote || "",
+          title: lineItem?.name || "",
+          image: lineItem?.image
+            ? {
+                url: lineItem.image.url,
+                alt: lineItem.image.altText || null,
+              }
+            : null,
+        };
+      }),
     })),
   };
 }
@@ -728,9 +770,6 @@ async function handleLookup(res, body) {
       !item.finalSale,
   }));
 
-  // Flag whether the order has any existing returns.
-  // This lets the frontend show existing return status to the customer
-  // even when there are no more returnable items.
   serialized.hasExistingReturn = serialized.returns.length > 0;
 
   return sendJson(res, 200, { ok: true, order: serialized });
