@@ -2,17 +2,14 @@ import { shopifyGraphQL } from "../_lib/shopify.js";
 import { verifyAppProxyRequest } from "../_lib/app-proxy.js";
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-/**
- * ============================================================
- * CONFIGURATION CONSTANTS
- * ============================================================
- */
+/* ============================================================
+   CONFIGURATION
+   ============================================================ */
 
 const RETURN_WINDOW_DAYS = 7;
 const DAMAGE_REPORT_WINDOW_HOURS = 48;
-const MAX_ORDER_QUERY_RESULTS = 20;
+const MAX_REQUEST_ITEMS = 100;
+const MAX_BODY_BYTES = 64 * 1024;
 
 const FINAL_SALE_TAGS = [
   "final-sale",
@@ -31,11 +28,19 @@ const FINAL_SALE_ATTR_KEYWORDS = [
   "monogram",
 ];
 
-/**
- * ============================================================
- * UTILITY FUNCTIONS
- * ============================================================
- */
+const REASON_MAP = {
+  "doesn't fit": "SIZE_TOO_SMALL",
+  "doesn’t fit": "SIZE_TOO_SMALL",
+  "not as described": "NOT_AS_DESCRIBED",
+  "changed my mind": "UNWANTED",
+  "damaged / defective": "DEFECTIVE",
+  "wrong item received": "WRONG_ITEM",
+  other: "OTHER",
+};
+
+/* ============================================================
+   UTILITIES
+   ============================================================ */
 
 function sendJson(res, status, data) {
   res.statusCode = status;
@@ -45,29 +50,30 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
 function normalizeOrderNumber(value) {
-  let orderNumber = String(value || "").trim().replace(/\s+/g, "");
-  if (orderNumber && !orderNumber.startsWith("#")) {
-    orderNumber = `#${orderNumber}`;
-  }
-  return orderNumber;
+  const number = String(value || "").trim().replace(/\s+/g, "");
+  return number && !number.startsWith("#") ? `#${number}` : number;
 }
 
-function isValidEmail(email) {
-  if (!email || email.length > 254) return false;
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+function isValidEmail(value) {
+  return (
+    value.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+  );
 }
 
 function escapeSearchValue(value) {
-  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
 }
 
 function escapeHtml(value) {
-  return String(value == null ? "" : value)
+  return String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -75,103 +81,126 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-function mapReturnReason(reason) {
-  const normalized = String(reason || "").trim().toLowerCase();
-
-  const map = {
-    "doesn't fit": "SIZE_TOO_SMALL",
-    "doesn’t fit": "SIZE_TOO_SMALL",
-    "not as described": "NOT_AS_DESCRIBED",
-    "changed my mind": "UNWANTED",
-    "damaged / defective": "DEFECTIVE",
-    "wrong item received": "WRONG_ITEM",
-    "other": "OTHER",
-  };
-
-  return map[normalized] || "OTHER";
+function normalizeReason(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
-function isWithinReturnWindow(deliveredAt) {
+function isWithinWindow(deliveredAt, milliseconds, now = Date.now()) {
   if (!deliveredAt) return false;
-  const delivered = new Date(deliveredAt).getTime();
-  if (isNaN(delivered)) return false;
-  const now = Date.now();
-  const diffMs = now - delivered;
-  return diffMs <= RETURN_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+  const timestamp = new Date(deliveredAt).getTime();
+  if (!Number.isFinite(timestamp)) return false;
+
+  const elapsed = now - timestamp;
+  return elapsed >= 0 && elapsed <= milliseconds;
 }
 
-function isWithinDamageWindow(deliveredAt) {
-  if (!deliveredAt) return false;
-  const delivered = new Date(deliveredAt).getTime();
-  if (isNaN(delivered)) return false;
-  const now = Date.now();
-  const diffMs = now - delivered;
-  return diffMs <= DAMAGE_REPORT_WINDOW_HOURS * 60 * 60 * 1000;
+function isWithinReturnWindow(deliveredAt, now) {
+  return isWithinWindow(
+    deliveredAt,
+    RETURN_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    now
+  );
+}
+
+function isWithinDamageWindow(deliveredAt, now) {
+  return isWithinWindow(
+    deliveredAt,
+    DAMAGE_REPORT_WINDOW_HOURS * 60 * 60 * 1000,
+    now
+  );
 }
 
 function isFinalSaleItem(item) {
-  const tags = (item.product?.tags || []).map((t) => String(t).toLowerCase());
-  const hasFinalSaleTag = tags.some((tag) =>
-    FINAL_SALE_TAGS.some((fs) => tag.includes(fs))
+  const tags = (item.product?.tags || []).map((tag) =>
+    String(tag).toLowerCase()
   );
 
-  const attrs = item.customAttributes || [];
-  const hasCustomAttr = attrs.some((attr) => {
-    const key = String(attr.key || "").toLowerCase();
-    return FINAL_SALE_ATTR_KEYWORDS.some((kw) => key.includes(kw));
+  const tagged = tags.some((tag) =>
+    FINAL_SALE_TAGS.some((keyword) => tag.includes(keyword))
+  );
+
+  const customized = (item.customAttributes || []).some((attribute) => {
+    const key = String(attribute.key || "").toLowerCase();
+    const value = String(attribute.value || "").trim();
+
+    return (
+      value !== "" &&
+      FINAL_SALE_ATTR_KEYWORDS.some((keyword) => key.includes(keyword))
+    );
   });
 
-  return hasFinalSaleTag || hasCustomAttr;
+  return tagged || customized;
+}
+
+function imageData(image) {
+  return image
+    ? { url: image.url, alt: image.altText || null }
+    : null;
+}
+
+function sumQuantity(items) {
+  return items.reduce((total, item) => total + item.availableQuantity, 0);
 }
 
 async function readBody(req) {
-  if (req.body !== undefined && req.body !== null) {
-    if (typeof req.body === "object") return req.body;
-    if (typeof req.body === "string") {
-      try {
-        return JSON.parse(req.body);
-      } catch {
-        throw new Error("Invalid JSON request body.");
+  let body = req.body;
+
+  if (body === undefined || body === null) {
+    const chunks = [];
+    let size = 0;
+
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+
+      if (size > MAX_BODY_BYTES) {
+        const error = new Error("Request body is too large.");
+        error.statusCode = 413;
+        throw error;
       }
+
+      chunks.push(buffer);
+    }
+
+    body = Buffer.concat(chunks).toString("utf8");
+  }
+
+  if (Buffer.isBuffer(body)) body = body.toString("utf8");
+
+  if (typeof body === "string") {
+    if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
+      const error = new Error("Request body is too large.");
+      error.statusCode = 413;
+      throw error;
+    }
+
+    try {
+      body = body ? JSON.parse(body) : {};
+    } catch {
+      const error = new Error("Invalid JSON request body.");
+      error.statusCode = 400;
+      throw error;
     }
   }
 
-  const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(chunk);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    const error = new Error("Invalid request body.");
+    error.statusCode = 400;
+    throw error;
   }
-  if (chunks.length === 0) return {};
 
-  const rawBody = Buffer.concat(chunks).toString("utf8");
-  if (!rawBody) return {};
-
-  try {
-    return JSON.parse(rawBody);
-  } catch {
-    throw new Error("Invalid JSON request body.");
-  }
+  return body;
 }
 
-/**
- * ============================================================
- * GRAPHQL QUERIES & MUTATIONS
- * ============================================================
- */
+/* ============================================================
+   GRAPHQL
+   ============================================================ */
 
-/**
- * Order lookup query — LIGHTWEIGHT.
- *
- * IMPORTANT: This query does NOT include `returnLineItems`.
- * Including it would push the query cost over the 1,000 limit
- * because of too many nested connections with high `first` values.
- *
- * Return line items are fetched separately via `RETURN_DETAILS_QUERY`
- * (only when the order has existing returns).
- */
-const ORDER_STATUS_QUERY = `
-  query OrderStatus($query: String!) {
+const FIND_ORDER_QUERY = `
+  query FindOrder($query: String!) {
     orders(
-      first: ${MAX_ORDER_QUERY_RESULTS}
+      first: 20
       query: $query
       sortKey: CREATED_AT
       reverse: true
@@ -190,93 +219,74 @@ const ORDER_STATUS_QUERY = `
             currencyCode
           }
         }
-        lineItems(first: 50) {
-          nodes {
-            id
-            name
-            quantity
-            image {
-              url
-              altText
-            }
-            originalUnitPriceSet {
-              shopMoney {
-                amount
-                currencyCode
-              }
-            }
-            fulfillmentStatus
-            customAttributes {
-              key
-              value
-            }
-            product {
-              id
-              tags
-            }
-          }
-        }
-        fulfillments(first: 10) {
+      }
+    }
+  }
+`;
+
+const ORDER_ITEMS_QUERY = `
+  query OrderItems($id: ID!, $after: String) {
+    order(id: $id) {
+      lineItems(first: 100, after: $after) {
+        nodes {
           id
-          status
-          deliveredAt
-          createdAt
-          trackingInfo {
-            number
+          name
+          quantity
+          image {
             url
+            altText
           }
-          fulfillmentLineItems(first: 50) {
-            edges {
-              node {
-                id
-                quantity
-                lineItem {
-                  id
-                }
-              }
+          originalUnitPriceSet {
+            shopMoney {
+              amount
+              currencyCode
             }
           }
-        }
-        returns(first: 20) {
-          nodes {
-            id
-            name
-            status
-            createdAt
-            requestApprovedAt
-            closedAt
+          customAttributes {
+            key
+            value
           }
+          product {
+            tags
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
   }
 `;
 
-/**
- * Return details query — fetches a SINGLE return with its line items.
- *
- * IMPORTANT: `returnLineItems` returns the `ReturnLineItemType` interface,
- * NOT the concrete `ReturnLineItem` type. To access `fulfillmentLineItem`,
- * we MUST use an inline fragment.
- *
- * @see https://community.shopify.dev/t/shouldnt-the-returnlineitemtype-include-a-connection-to-the-lineitem/7502
- */
-const RETURN_DETAILS_QUERY = `
-  query ReturnDetails($id: ID!) {
-    return(id: $id) {
-      id
-      name
-      status
-      createdAt
-      requestApprovedAt
-      closedAt
-      returnLineItems(first: 50) {
+const ORDER_RETURNS_QUERY = `
+  query OrderReturns($id: ID!, $after: String) {
+    order(id: $id) {
+      returns(first: 50, after: $after) {
         nodes {
+          id
+          name
+          status
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
+const RETURN_DETAILS_QUERY = `
+  query ReturnDetails($id: ID!, $after: String) {
+    return(id: $id) {
+      returnLineItems(first: 100, after: $after) {
+        nodes {
+          id
+          quantity
+          returnReason
+          customerNote
           ... on ReturnLineItem {
-            id
-            quantity
-            returnReason
-            returnReasonNote
             fulfillmentLineItem {
               id
               lineItem {
@@ -289,12 +299,10 @@ const RETURN_DETAILS_QUERY = `
               }
             }
           }
-          ... on UnverifiedReturnLineItem {
-            id
-            quantity
-            returnReason
-            returnReasonNote
-          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -302,29 +310,43 @@ const RETURN_DETAILS_QUERY = `
 `;
 
 const RETURNABLE_FULFILLMENTS_QUERY = `
-  query ReturnableFulfillments($orderId: ID!) {
-    returnableFulfillments(orderId: $orderId, first: 10) {
-      edges {
-        node {
+  query ReturnableFulfillments($orderId: ID!, $after: String) {
+    returnableFulfillments(
+      orderId: $orderId
+      first: 25
+      after: $after
+    ) {
+      nodes {
+        id
+        fulfillment {
           id
-          returnableFulfillmentLineItems(first: 50) {
-            edges {
-              node {
-                quantity
-                fulfillmentLineItem {
-                  id
-                  lineItem {
-                    id
-                    name
-                    image {
-                      url
-                      altText
-                    }
-                  }
-                }
-              }
+          deliveredAt
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+const RETURNABLE_ITEMS_QUERY = `
+  query ReturnableItems($id: ID!, $after: String) {
+    returnableFulfillment(id: $id) {
+      returnableFulfillmentLineItems(first: 100, after: $after) {
+        nodes {
+          quantity
+          fulfillmentLineItem {
+            id
+            lineItem {
+              id
             }
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -338,7 +360,6 @@ const RETURN_REQUEST_MUTATION = `
         id
         name
         status
-        createdAt
       }
       userErrors {
         field
@@ -364,392 +385,205 @@ const RETURN_APPROVE_MUTATION = `
   }
 `;
 
-/**
- * ============================================================
- * CORE BUSINESS LOGIC
- * ============================================================
- */
+/* ============================================================
+   PAGINATION AND DATA FETCHING
+   ============================================================ */
 
-async function findOrder(orderNumber, email) {
-  const query = `name:"${escapeSearchValue(orderNumber)}"`;
-  const data = await shopifyGraphQL(ORDER_STATUS_QUERY, { query });
-  const orders = data?.orders?.nodes || [];
+async function collectPages(query, variables, getConnection) {
+  const results = [];
+  let after = null;
 
-  const order = orders.find((o) => {
-    const shopifyOrderNumber = String(o.name || "").trim();
-    const shopifyEmail = normalizeEmail(o.email);
-    return (
-      shopifyOrderNumber === orderNumber &&
-      shopifyEmail === email
-    );
-  });
-
-  if (!order) {
-    console.log(
-      "findOrder: No match. Order number:",
-      orderNumber,
-      "| Email:",
-      email,
-      "| Orders found by name:",
-      orders.length
-    );
-    return null;
-  }
-
-  return order;
-}
-
-/**
- * Fetch return line items for a single return.
- * Called only when the order has existing returns.
- */
-async function fetchReturnLineItems(returnId) {
-  try {
-    const data = await shopifyGraphQL(RETURN_DETAILS_QUERY, { id: returnId });
-    const ret = data?.return;
-    if (!ret) return null;
-
-    return {
-      id: ret.id,
-      name: ret.name,
-      status: ret.status,
-      createdAt: ret.createdAt,
-      requestApprovedAt: ret.requestApprovedAt,
-      closedAt: ret.closedAt,
-      items: (ret.returnLineItems?.nodes || [])
-        .map((li) => {
-          const fli = li.fulfillmentLineItem;
-          if (!fli) return null;
-          const lineItem = fli?.lineItem;
-          return {
-            id: li.id,
-            quantity: li.quantity,
-            returnReason: li.returnReason,
-            returnReasonNote: li.returnReasonNote || "",
-            title: lineItem?.name || "",
-            image: lineItem?.image
-              ? {
-                  url: lineItem.image.url,
-                  alt: lineItem.image.altText || null,
-                }
-              : null,
-          };
-        })
-        .filter(Boolean),
-    };
-  } catch (err) {
-    console.error("fetchReturnLineItems failed:", err);
-    return null;
-  }
-}
-
-async function getReturnableFulfillmentLineItems(orderId) {
-  const data = await shopifyGraphQL(RETURNABLE_FULFILLMENTS_QUERY, { orderId });
-  const fulfillments = data?.returnableFulfillments?.edges || [];
-  const lineItems = [];
-
-  fulfillments.forEach((edge) => {
-    const items = edge.node?.returnableFulfillmentLineItems?.edges || [];
-    items.forEach((itemEdge) => {
-      const item = itemEdge.node;
-      const fli = item?.fulfillmentLineItem;
-      if (fli?.id && fli?.lineItem?.id) {
-        lineItems.push({
-          fulfillmentLineItemId: fli.id,
-          lineItemId: fli.lineItem.id,
-          availableQuantity: item.quantity,
-          title: fli.lineItem.name || "",
-          image: fli.lineItem.image
-            ? {
-                url: fli.lineItem.image.url,
-                alt: fli.lineItem.image.altText || null,
-              }
-            : null,
-        });
-      }
-    });
-  });
-
-  return lineItems;
-}
-
-function buildDeliveryMap(order) {
-  const map = new Map();
-  (order.fulfillments || []).forEach((f) => {
-    if (!f.deliveredAt) return;
-    (f.fulfillmentLineItems?.edges || []).forEach((edge) => {
-      map.set(edge.node.lineItem.id, f.deliveredAt);
-    });
-  });
-  return map;
-}
-
-async function createAndApproveReturn(orderId, returnLineItems) {
-  const requestInput = {
-    orderId,
-    returnLineItems: returnLineItems.map((item) => ({
-      fulfillmentLineItemId: item.fulfillmentLineItemId,
-      quantity: item.quantity,
-      returnReason: item.returnReason,
-      customerNote: item.customerNote || "",
-    })),
-  };
-
-  console.log("Creating return request...");
-  const requestData = await shopifyGraphQL(RETURN_REQUEST_MUTATION, {
-    input: requestInput,
-  });
-
-  const requestPayload = requestData?.returnRequest;
-  const requestErrors = requestPayload?.userErrors || [];
-
-  if (requestErrors.length > 0) {
-    console.error("returnRequest userErrors:", requestErrors);
-    return { ok: false, errors: requestErrors };
-  }
-
-  const returnData = requestPayload?.return;
-  if (!returnData?.id) {
-    return {
-      ok: false,
-      errors: [{ message: "Return request created but no ID returned." }],
-    };
-  }
-
-  console.log(
-    `Return request created — id: ${returnData.id}, name: ${returnData.name}, status: ${returnData.status}`
-  );
-
-  console.log("Approving return request and notifying customer...");
-  const approveData = await shopifyGraphQL(RETURN_APPROVE_MUTATION, {
-    input: {
-      id: returnData.id,
-      notifyCustomer: true,
-    },
-  });
-
-  const approvePayload = approveData?.returnApproveRequest;
-  const approveErrors = approvePayload?.userErrors || [];
-
-  if (approveErrors.length > 0) {
-    console.error(
-      "AUTO-APPROVE FAILED:",
-      JSON.stringify(approveErrors, null, 2)
-    );
-    return {
-      ok: true,
-      returnData: returnData,
-      autoApproved: false,
-      approvalError: approveErrors[0]?.message || "Approval failed.",
-    };
-  }
-
-  console.log("Return request approved and customer notified.");
-  return {
-    ok: true,
-    returnData: approvePayload?.return || returnData,
-    autoApproved: true,
-  };
-}
-
-/**
- * ============================================================
- * EMAIL NOTIFICATIONS (Merchant only — customer handled by Shopify)
- * ============================================================
- */
-
-async function sendMerchantNotification({ order, returnData, items }) {
-  console.log("=== sendMerchantNotification START ===");
-
-  const merchantEmail = process.env.MERCHANT_EMAIL;
-  const fromEmail = process.env.FROM_EMAIL;
-  const storeName = process.env.STORE_NAME || "Store";
-  const adminUrl = process.env.STORE_ADMIN_URL || "";
-
-  if (!merchantEmail || !fromEmail || !process.env.RESEND_API_KEY) {
-    console.warn("Merchant notification skipped — missing env vars.");
-    return { skipped: true };
-  }
-
-  const orderId = String(order.id || "").split("/").pop();
-  const orderLink = adminUrl ? `${adminUrl}/orders/${orderId}` : "";
-  const returnName = returnData?.name || "Return";
-
-  const itemsHtml = items
-    .map((i) => {
-      const imgUrl = i.image && i.image.url ? i.image.url : "";
-      const imgAlt = i.image && i.image.alt ? i.image.alt : (i.title || "");
-
-      const imgCell = imgUrl
-        ? `<img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(imgAlt)}"
-             width="48" height="48"
-             style="display:block;width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #eee;" />`
-        : `<div style="width:48px;height:48px;background:#f0f0f0;border-radius:4px;border:1px solid #eee;"></div>`;
-
-      return `
-        <tr>
-          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;width:56px;">
-            ${imgCell}
-          </td>
-          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
-            ${escapeHtml(i.title || "")}
-          </td>
-          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;text-align:center;font-size:14px;">
-            ${escapeHtml(i.quantity)}
-          </td>
-          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
-            ${escapeHtml(i.reason || "")}
-          </td>
-          <td style="padding:10px 8px;border-bottom:1px solid #eee;vertical-align:middle;font-size:14px;">
-            ${escapeHtml(i.note || "—")}
-          </td>
-        </tr>`;
-    })
-    .join("");
-
-  const customerDisplay = order.email || "Customer";
-
-  const html = `
-    <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;color:#333;">
-      <h2 style="margin:0 0 16px;">New return request (auto-approved)</h2>
-      <p>
-        A customer has submitted a return request for <strong>${escapeHtml(storeName)}</strong>.
-        The return has been <strong>automatically approved</strong>.
-      </p>
-
-      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
-        <tr>
-          <td style="padding:8px;background:#f5f5f5;width:160px;"><strong>Order</strong></td>
-          <td style="padding:8px;">${escapeHtml(order.name || "")}</td>
-        </tr>
-        <tr>
-          <td style="padding:8px;background:#f5f5f5;"><strong>Return</strong></td>
-          <td style="padding:8px;">${escapeHtml(returnName)}</td>
-        </tr>
-        <tr>
-          <td style="padding:8px;background:#f5f5f5;"><strong>Customer</strong></td>
-          <td style="padding:8px;">${escapeHtml(customerDisplay)}</td>
-        </tr>
-      </table>
-
-      <h3 style="margin:24px 0 8px;font-size:16px;">Items</h3>
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        <thead>
-          <tr style="background:#f5f5f5;">
-            <th style="padding:8px;text-align:left;width:56px;"></th>
-            <th style="padding:8px;text-align:left;">Item</th>
-            <th style="padding:8px;text-align:center;">Qty</th>
-            <th style="padding:8px;text-align:left;">Reason</th>
-            <th style="padding:8px;text-align:left;">Note</th>
-          </tr>
-        </thead>
-        <tbody>${itemsHtml}</tbody>
-      </table>
-
-      <div style="background:#fff3cd;border:1px solid #ffc107;padding:12px;border-radius:4px;margin:16px 0;">
-        <strong>⚠️ Return Policy Reminders:</strong>
-        <ul style="margin:8px 0 0;padding-left:20px;font-size:13px;">
-          <li>Return window: 7 days from delivery</li>
-          <li>Customer pays return shipping</li>
-          <li>No return labels provided</li>
-          <li>Refund within 2-5 business days after inspection</li>
-          <li>Original shipping costs are non-refundable</li>
-          <li>Inspect the item upon receipt before issuing refund</li>
-        </ul>
-      </div>
-
-      ${
-        orderLink
-          ? `<p style="margin-top:24px;">
-              <a href="${escapeHtml(orderLink)}" style="display:inline-block;padding:10px 20px;background:#121212;color:#fff;text-decoration:none;border-radius:4px;">
-                View in Shopify Admin
-              </a>
-            </p>`
-          : ""
-      }
-
-      <p style="margin-top:24px;font-size:12px;color:#888;">
-        This is an automated notification from ${escapeHtml(storeName)}.
-      </p>
-    </div>
-  `;
-
-  const text = `
-New return request (auto-approved)
-
-Order: ${order.name}
-Return: ${returnName}
-Customer: ${order.email}
-
-Items:
-${items
-  .map(
-    (i) =>
-      `- ${i.title} (Qty ${i.quantity}) — ${i.reason}${
-        i.note ? ` — ${i.note}` : ""
-      }`
-  )
-  .join("\n")}
-
-${orderLink ? `View: ${orderLink}` : ""}
-  `.trim();
-
-  try {
-    const result = await resend.emails.send({
-      from: `${storeName} <${fromEmail}>`,
-      to: merchantEmail,
-      replyTo: order.email || undefined,
-      subject: `New return request (auto-approved) — ${order.name} (${returnName})`,
-      html,
-      text,
+  while (true) {
+    const data = await shopifyGraphQL(query, {
+      ...variables,
+      after,
     });
 
-    if (result?.error) {
-      console.error("Resend returned error:", result.error);
-      return { ok: false, error: result.error };
+    const connection = getConnection(data);
+
+    if (!connection) {
+      throw new Error("Shopify returned an incomplete response.");
     }
 
-    console.log("Merchant notification sent:", result?.data?.id);
-    return { ok: true, id: result?.data?.id };
-  } catch (err) {
-    console.error("Resend send failed:", err);
-    return { ok: false, error: err.message };
+    results.push(...(connection.nodes || []));
+
+    if (!connection.pageInfo?.hasNextPage) break;
+
+    const nextCursor = connection.pageInfo.endCursor;
+
+    if (!nextCursor || nextCursor === after) {
+      throw new Error("Invalid Shopify pagination cursor.");
+    }
+
+    after = nextCursor;
   }
+
+  return results;
 }
 
-/**
- * ============================================================
- * SERIALIZATION
- * ============================================================
- */
+async function findOrder(orderNumber, email) {
+  const data = await shopifyGraphQL(FIND_ORDER_QUERY, {
+    query: `name:"${escapeSearchValue(orderNumber)}"`,
+  });
 
-function serializeOrder(order, returnDetails) {
-  const deliveryMap = buildDeliveryMap(order);
+  return (data?.orders?.nodes || []).find(
+    (order) =>
+      String(order.name || "").trim() === orderNumber &&
+      normalizeEmail(order.email) === email
+  ) || null;
+}
 
-  // Merge return details (line items) into the base returns array.
-  const baseReturns = (order.returns?.nodes || []).map((r) => ({
-    id: r.id,
-    name: r.name,
-    status: r.status,
-    createdAt: r.createdAt,
-    requestApprovedAt: r.requestApprovedAt,
-    closedAt: r.closedAt,
-    items: [],
-  }));
+async function fetchOrderItems(orderId) {
+  return collectPages(
+    ORDER_ITEMS_QUERY,
+    { id: orderId },
+    (data) => data?.order?.lineItems
+  );
+}
 
-  // If returnDetails array is provided, attach items to matching returns.
-  if (Array.isArray(returnDetails) && returnDetails.length) {
-    const detailsById = new Map();
-    returnDetails.forEach((d) => {
-      if (d && d.id) detailsById.set(d.id, d);
-    });
-    baseReturns.forEach((r) => {
-      const d = detailsById.get(r.id);
-      if (d && Array.isArray(d.items)) {
-        r.items = d.items;
-      }
+async function fetchExistingReturns(orderId) {
+  const returns = await collectPages(
+    ORDER_RETURNS_QUERY,
+    { id: orderId },
+    (data) => data?.order?.returns
+  );
+
+  const results = [];
+
+  // Sequential fetching avoids a large burst of GraphQL requests.
+  for (const existingReturn of returns) {
+    const lines = await collectPages(
+      RETURN_DETAILS_QUERY,
+      { id: existingReturn.id },
+      (data) => data?.return?.returnLineItems
+    );
+
+    results.push({
+      ...existingReturn,
+      items: lines.map((line) => {
+        const item = line.fulfillmentLineItem?.lineItem;
+
+        return {
+          id: line.id,
+          quantity: line.quantity,
+          returnReason: line.returnReason,
+          returnReasonNote: line.customerNote || "",
+          title: item?.name || "Returned item",
+          image: imageData(item?.image),
+        };
+      }),
     });
   }
+
+  return results;
+}
+
+async function fetchReturnableItems(orderId) {
+  const fulfillments = await collectPages(
+    RETURNABLE_FULFILLMENTS_QUERY,
+    { orderId },
+    (data) => data?.returnableFulfillments
+  );
+
+  const results = [];
+
+  for (const fulfillment of fulfillments) {
+    const lines = await collectPages(
+      RETURNABLE_ITEMS_QUERY,
+      { id: fulfillment.id },
+      (data) => data?.returnableFulfillment
+        ?.returnableFulfillmentLineItems
+    );
+
+    for (const line of lines) {
+      const fulfillmentLineItem = line.fulfillmentLineItem;
+      const quantity = Number(line.quantity);
+
+      if (
+        !fulfillmentLineItem?.id ||
+        !fulfillmentLineItem.lineItem?.id ||
+        !Number.isInteger(quantity) ||
+        quantity <= 0
+      ) {
+        continue;
+      }
+
+      results.push({
+        fulfillmentLineItemId: fulfillmentLineItem.id,
+        lineItemId: fulfillmentLineItem.lineItem.id,
+        deliveredAt: fulfillment.fulfillment?.deliveredAt || null,
+        availableQuantity: quantity,
+      });
+    }
+  }
+
+  return results;
+}
+
+/* ============================================================
+   SHARED ELIGIBILITY
+   Used by BOTH lookup and submission.
+   ============================================================ */
+
+function getItemEligibility(item, returnableItems, now) {
+  const candidates = returnableItems.filter(
+    (candidate) => candidate.lineItemId === item.id
+  );
+
+  const deliveredCandidates = candidates.filter((candidate) =>
+    candidate.deliveredAt &&
+    Number.isFinite(new Date(candidate.deliveredAt).getTime()) &&
+    new Date(candidate.deliveredAt).getTime() <= now
+  );
+
+  const withinWindowCandidates = candidates.filter((candidate) =>
+    isWithinReturnWindow(candidate.deliveredAt, now)
+  );
+
+  const eligibleCandidates = isFinalSaleItem(item)
+    ? []
+    : withinWindowCandidates;
+
+  let ineligibilityReason = "";
+
+  if (isFinalSaleItem(item)) {
+    ineligibilityReason =
+      "This item is final sale or personalized and cannot be returned.";
+  } else if (!candidates.length) {
+    ineligibilityReason =
+      "No quantity is currently available for return. This item may be unfulfilled or already included in a return.";
+  } else if (!deliveredCandidates.length) {
+    ineligibilityReason =
+      "Not eligible yet — this item has not been marked as delivered.";
+  } else if (!withinWindowCandidates.length) {
+    ineligibilityReason =
+      `The ${RETURN_WINDOW_DAYS}-day return window has ended.`;
+  }
+
+  const deliveryDates = deliveredCandidates
+    .map((candidate) => candidate.deliveredAt)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+
+  return {
+    eligible: eligibleCandidates.length > 0,
+    ineligibilityReason,
+    candidates: eligibleCandidates,
+    availableQuantity: sumQuantity(eligibleCandidates),
+    deliveredAt: deliveryDates[0] || null,
+    finalSale: isFinalSaleItem(item),
+    withinWindow: withinWindowCandidates.length > 0,
+    withinDamageWindow: eligibleCandidates.some((candidate) =>
+      isWithinDamageWindow(candidate.deliveredAt, now)
+    ),
+  };
+}
+
+/* ============================================================
+   SERIALIZATION
+   ============================================================ */
+
+function serializeOrder(order, items, returnableItems, returns) {
+  const now = Date.now();
 
   return {
     number: order.name,
@@ -764,66 +598,243 @@ function serializeOrder(order, returnDetails) {
           currency: order.totalPriceSet.shopMoney.currencyCode,
         }
       : null,
-    items: (order.lineItems?.nodes || []).map((item) => {
-      const deliveredAt = deliveryMap.get(item.id) || null;
-      const withinWindow = isWithinReturnWindow(deliveredAt);
-      const withinDamageWindow = isWithinDamageWindow(deliveredAt);
-      const finalSale = isFinalSaleItem(item);
+
+    // Do not filter: all order line items remain visible.
+    items: items.map((item) => {
+      const eligibility = getItemEligibility(
+        item,
+        returnableItems,
+        now
+      );
 
       return {
         id: item.id,
         title: item.name,
-        quantity: item.quantity,
-        image: item.image
-          ? { url: item.image.url, alt: item.image.altText || null }
-          : null,
+
+        // Existing frontend uses quantity as the return stepper maximum.
+        quantity: eligibility.eligible
+          ? eligibility.availableQuantity
+          : item.quantity,
+
+        orderedQuantity: item.quantity,
+        returnableQuantity: eligibility.availableQuantity,
+        eligible: eligibility.eligible,
+        ineligibilityReason: eligibility.ineligibilityReason,
+        deliveredAt: eligibility.deliveredAt,
+        withinWindow: eligibility.withinWindow,
+        withinDamageWindow: eligibility.withinDamageWindow,
+        finalSale: eligibility.finalSale,
+        image: imageData(item.image),
         unitPrice: item.originalUnitPriceSet?.shopMoney
           ? {
               amount: item.originalUnitPriceSet.shopMoney.amount,
               currency: item.originalUnitPriceSet.shopMoney.currencyCode,
             }
           : null,
-        fulfillmentStatus: item.fulfillmentStatus,
-        deliveredAt,
-        withinWindow,
-        withinDamageWindow,
-        finalSale,
       };
     }),
-    returns: baseReturns,
+
+    returns,
+    hasExistingReturn: returns.length > 0,
   };
 }
 
-/**
- * ============================================================
- * REQUEST HANDLERS
- * ============================================================
- */
+/* ============================================================
+   RETURN CREATION AND APPROVAL
+   ============================================================ */
 
-async function handleLookup(res, body) {
-  const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
-  const email = normalizeEmail(body.email);
+async function createAndApproveReturn(orderId, returnLineItems) {
+  const requestData = await shopifyGraphQL(
+    RETURN_REQUEST_MUTATION,
+    {
+      input: {
+        orderId,
+        returnLineItems,
+      },
+    }
+  );
 
-  if (!orderNumber || !email) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Order number and email are required.",
-    });
-  }
-  if (!isValidEmail(email)) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Please enter a valid email address.",
-    });
-  }
-  if (orderNumber.length > 50) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Invalid order number.",
-    });
+  const payload = requestData?.returnRequest;
+  const errors = payload?.userErrors || [];
+
+  if (errors.length) {
+    return { ok: false, errors };
   }
 
+  const createdReturn = payload?.return;
+
+  if (!createdReturn?.id) {
+    throw new Error("Shopify did not return a return ID.");
+  }
+
+  // After creation succeeds, an approval failure must not tell
+  // the customer to recreate the same return request.
+  try {
+    const approvalData = await shopifyGraphQL(
+      RETURN_APPROVE_MUTATION,
+      {
+        input: {
+          id: createdReturn.id,
+          notifyCustomer: true,
+        },
+      }
+    );
+
+    const approval = approvalData?.returnApproveRequest;
+
+    if (approval?.userErrors?.length || !approval?.return?.id) {
+      console.error(
+        "Return created but approval failed:",
+        createdReturn.id,
+        approval?.userErrors
+      );
+
+      return {
+        ok: true,
+        returnData: createdReturn,
+        autoApproved: false,
+      };
+    }
+
+    return {
+      ok: true,
+      returnData: approval.return,
+      autoApproved: true,
+    };
+  } catch (error) {
+    console.error(
+      "Return created but approval request failed:",
+      createdReturn.id,
+      error
+    );
+
+    return {
+      ok: true,
+      returnData: createdReturn,
+      autoApproved: false,
+    };
+  }
+}
+
+/* ============================================================
+   MERCHANT NOTIFICATION
+   ============================================================ */
+
+async function sendMerchantNotification({
+  order,
+  returnData,
+  items,
+  autoApproved,
+}) {
+  const merchantEmail = process.env.MERCHANT_EMAIL;
+  const fromEmail = process.env.FROM_EMAIL;
+  const apiKey = process.env.RESEND_API_KEY;
+  const storeName = process.env.STORE_NAME || "Store";
+  const adminBase = (process.env.STORE_ADMIN_URL || "")
+    .replace(/\/+$/, "");
+
+  if (!merchantEmail || !fromEmail || !apiKey) {
+    console.warn("Merchant notification skipped: missing configuration.");
+    return;
+  }
+
+  const resend = new Resend(apiKey);
+  const orderId = String(order.id).split("/").pop();
+  const orderLink = adminBase
+    ? `${adminBase}/orders/${orderId}`
+    : "";
+
+  const approvalLabel = autoApproved
+    ? "Auto-approved"
+    : "Awaiting review";
+
+  const rows = items.map((item) => `
+    <tr>
+      <td style="padding:10px;border-bottom:1px solid #eee;">
+        ${escapeHtml(item.title)}
+      </td>
+      <td style="padding:10px;border-bottom:1px solid #eee;">
+        ${escapeHtml(item.quantity)}
+      </td>
+      <td style="padding:10px;border-bottom:1px solid #eee;">
+        ${escapeHtml(item.reason)}
+      </td>
+      <td style="padding:10px;border-bottom:1px solid #eee;">
+        ${escapeHtml(item.note || "—")}
+      </td>
+    </tr>
+  `).join("");
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:680px;color:#333;">
+      <h2>New return request — ${escapeHtml(approvalLabel)}</h2>
+      <p><strong>Store:</strong> ${escapeHtml(storeName)}</p>
+      <p><strong>Order:</strong> ${escapeHtml(order.name)}</p>
+      <p><strong>Return:</strong> ${escapeHtml(returnData.name)}</p>
+      <p><strong>Customer:</strong> ${escapeHtml(order.email)}</p>
+
+      <table style="width:100%;border-collapse:collapse;text-align:left;">
+        <thead>
+          <tr>
+            <th style="padding:10px;">Item</th>
+            <th style="padding:10px;">Qty</th>
+            <th style="padding:10px;">Reason</th>
+            <th style="padding:10px;">Details</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+
+      <p>Return window: ${RETURN_WINDOW_DAYS} days from delivery.</p>
+      <p>
+        Damage reports: within ${DAMAGE_REPORT_WINDOW_HOURS}
+        hours of delivery.
+      </p>
+
+      ${orderLink
+        ? `<p><a href="${escapeHtml(orderLink)}">View order in Shopify Admin</a></p>`
+        : ""}
+    </div>
+  `;
+
+  const text = [
+    `New return request — ${approvalLabel}`,
+    `Order: ${order.name}`,
+    `Return: ${returnData.name}`,
+    `Customer: ${order.email}`,
+    "",
+    ...items.map(
+      (item) =>
+        `- ${item.title} (Qty ${item.quantity}) — ${item.reason}` +
+        (item.note ? ` — ${item.note}` : "")
+    ),
+    "",
+    orderLink,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from: `${storeName} <${fromEmail}>`,
+    to: merchantEmail,
+    replyTo: order.email || undefined,
+    subject:
+      `New return request (${approvalLabel}) — ` +
+      `${order.name} (${returnData.name})`,
+    html,
+    text,
+  });
+
+  if (result?.error) {
+    console.error("Merchant notification failed:", result.error);
+  }
+}
+
+/* ============================================================
+   LOOKUP
+   ============================================================ */
+
+async function handleLookup(res, orderNumber, email) {
   const order = await findOrder(orderNumber, email);
+
   if (!order) {
     return sendJson(res, 404, {
       ok: false,
@@ -831,179 +842,192 @@ async function handleLookup(res, body) {
     });
   }
 
-  let returnableIds = new Set();
-  try {
-    const returnable = await getReturnableFulfillmentLineItems(order.id);
-    returnable.forEach((r) => returnableIds.add(r.lineItemId));
-  } catch (err) {
-    console.error("Failed to fetch returnable items:", err);
-  }
+  // Fail closed if Shopify eligibility cannot be retrieved.
+  const items = await fetchOrderItems(order.id);
+  const returnableItems = await fetchReturnableItems(order.id);
+  const returns = await fetchExistingReturns(order.id);
 
-  // Fetch return line items ONLY if there are existing returns.
-  // This is a separate query to keep the main order query cost under 1,000.
-  let returnDetails = [];
-  const existingReturns = order.returns?.nodes || [];
-  if (existingReturns.length > 0) {
-    // Fetch details for each return in parallel.
-    const detailsResults = await Promise.all(
-      existingReturns.map((r) => fetchReturnLineItems(r.id))
-    );
-    returnDetails = detailsResults.filter(Boolean);
-  }
-
-  const serialized = serializeOrder(order, returnDetails);
-
-  serialized.items = serialized.items.map((item) => ({
-    ...item,
-    eligible:
-      returnableIds.has(item.id) &&
-      item.withinWindow &&
-      !item.finalSale,
-  }));
-
-  serialized.hasExistingReturn = serialized.returns.length > 0;
-
-  return sendJson(res, 200, { ok: true, order: serialized });
+  return sendJson(res, 200, {
+    ok: true,
+    order: serializeOrder(order, items, returnableItems, returns),
+  });
 }
 
-async function handleSubmit(res, body) {
-  const orderNumber = normalizeOrderNumber(body.orderNumber || body.order_number);
-  const email = normalizeEmail(body.email);
-  const items = Array.isArray(body.items) ? body.items : [];
+/* ============================================================
+   SUBMISSION
+   ============================================================ */
 
-  if (!orderNumber || !email) {
+async function handleSubmit(res, body, orderNumber, email) {
+  const requestedItems = Array.isArray(body.items) ? body.items : [];
+
+  if (
+    !requestedItems.length ||
+    requestedItems.length > MAX_REQUEST_ITEMS
+  ) {
     return sendJson(res, 400, {
       ok: false,
-      error: "Order number and email are required.",
-    });
-  }
-  if (!isValidEmail(email)) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "Please enter a valid email address.",
-    });
-  }
-  if (!items.length) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "At least one item is required.",
+      error: `Select between 1 and ${MAX_REQUEST_ITEMS} items.`,
     });
   }
 
   const order = await findOrder(orderNumber, email);
+
   if (!order) {
     return sendJson(res, 404, {
       ok: false,
-      error: "Order not found.",
+      error: "We couldn't find an order matching those details.",
     });
   }
 
-  let returnable;
-  try {
-    returnable = await getReturnableFulfillmentLineItems(order.id);
-  } catch (err) {
-    console.error("Failed to fetch returnable fulfillments:", err);
-    return sendJson(res, 500, {
-      ok: false,
-      error: "Could not retrieve returnable items from Shopify.",
-    });
-  }
+  // Re-fetch current data. Never trust frontend eligibility.
+  const orderItems = await fetchOrderItems(order.id);
+  const returnableItems = await fetchReturnableItems(order.id);
+  const itemsById = new Map(orderItems.map((item) => [item.id, item]));
 
-  if (!returnable.length) {
-    return sendJson(res, 400, {
-      ok: false,
-      error: "This order has no items eligible for return.",
-    });
-  }
-
-  const deliveryMap = buildDeliveryMap(order);
+  const seenIds = new Set();
   const returnLineItems = [];
   const enrichedItems = [];
+  const now = Date.now();
 
-  for (const requestedItem of items) {
-    const match = returnable.find(
-      (r) => r.lineItemId === requestedItem.item_id
+  for (const requested of requestedItems) {
+    if (!requested || typeof requested !== "object") {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid return item.",
+      });
+    }
+
+    const itemId = String(requested.item_id || "");
+    const item = itemsById.get(itemId);
+
+    if (!item || seenIds.has(itemId)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid or duplicate return item.",
+      });
+    }
+
+    seenIds.add(itemId);
+
+    const reasonKey = normalizeReason(requested.reason);
+    const returnReason = REASON_MAP[reasonKey];
+
+    if (!Object.prototype.hasOwnProperty.call(REASON_MAP, reasonKey)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: `Please select a valid return reason for "${item.name}".`,
+      });
+    }
+
+    const quantity = Number(requested.quantity);
+
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: `Invalid quantity for "${item.name}".`,
+      });
+    }
+
+    const eligibility = getItemEligibility(
+      item,
+      returnableItems,
+      now
     );
 
-    if (!match) {
-      console.warn("No returnable match for item_id:", requestedItem.item_id);
+    if (!eligibility.eligible) {
       return sendJson(res, 400, {
         ok: false,
-        error: `Item "${requestedItem.title || requestedItem.item_id}" is not eligible for return.`,
+        error: `"${item.name}": ${eligibility.ineligibilityReason}`,
       });
     }
 
-    const deliveredAt = deliveryMap.get(requestedItem.item_id) || null;
-    const isDamaged =
-      String(requestedItem.reason || "").toLowerCase().includes("damaged") ||
-      String(requestedItem.reason || "").toLowerCase().includes("defective");
+    const isDamaged = returnReason === "DEFECTIVE";
 
-    if (!isWithinReturnWindow(deliveredAt)) {
+    // For damaged items, allocate only quantities delivered
+    // within the damage-report window.
+    const candidates = eligibility.candidates
+      .filter((candidate) =>
+        !isDamaged ||
+        isWithinDamageWindow(candidate.deliveredAt, now)
+      )
+      .sort(
+        (a, b) =>
+          new Date(a.deliveredAt).getTime() -
+          new Date(b.deliveredAt).getTime()
+      );
+
+    const availableQuantity = sumQuantity(candidates);
+
+    if (quantity > availableQuantity) {
       return sendJson(res, 400, {
         ok: false,
-        error: `Item "${requestedItem.title}" is outside the ${RETURN_WINDOW_DAYS}-day return window.`,
+        error: isDamaged
+          ? `"${item.name}": only ${availableQuantity} unit(s) qualify for a damage report within ${DAMAGE_REPORT_WINDOW_HOURS} hours of delivery.`
+          : `"${item.name}": only ${availableQuantity} unit(s) are currently eligible for return.`,
       });
     }
 
-    if (isDamaged && !isWithinDamageWindow(deliveredAt)) {
-      return sendJson(res, 400, {
-        ok: false,
-        error: `Damaged/defective items must be reported within ${DAMAGE_REPORT_WINDOW_HOURS} hours of delivery.`,
+    const note = String(requested.details || "").trim().slice(0, 300);
+    let remaining = quantity;
+
+    // One order line can span multiple fulfillment line items.
+    for (const candidate of candidates) {
+      if (remaining === 0) break;
+
+      const allocatedQuantity = Math.min(
+        remaining,
+        candidate.availableQuantity
+      );
+
+      returnLineItems.push({
+        fulfillmentLineItemId: candidate.fulfillmentLineItemId,
+        quantity: allocatedQuantity,
+        returnReason,
+        customerNote: note,
       });
+
+      remaining -= allocatedQuantity;
     }
-
-    const qty = Math.min(
-      Number(requestedItem.quantity) || 1,
-      match.availableQuantity
-    );
-
-    const noteText = (requestedItem.details || "").slice(0, 300);
-
-    returnLineItems.push({
-      fulfillmentLineItemId: match.fulfillmentLineItemId,
-      quantity: qty,
-      returnReason: mapReturnReason(requestedItem.reason),
-      customerNote: noteText,
-    });
 
     enrichedItems.push({
-      item_id: requestedItem.item_id,
-      title: requestedItem.title || match.title,
-      quantity: qty,
-      reason: requestedItem.reason,
-      note: noteText,
-      image: match.image || null,
+      item_id: item.id,
+      title: item.name,
+      quantity,
+      reason: String(requested.reason).trim(),
+      note,
     });
   }
 
-  let result;
-  try {
-    result = await createAndApproveReturn(order.id, returnLineItems);
-  } catch (err) {
-    console.error("Return creation/approval failed:", err);
-    return sendJson(res, 500, {
+  // Shopify input arrays accept at most 250 elements.
+  if (returnLineItems.length > 250) {
+    return sendJson(res, 400, {
       ok: false,
-      error: "An unexpected error occurred while creating the return.",
+      error: "Too many fulfillment items. Please submit fewer items.",
     });
   }
+
+  const result = await createAndApproveReturn(
+    order.id,
+    returnLineItems
+  );
 
   if (!result.ok) {
-    const errorMsg =
-      result.errors?.[0]?.message || "Failed to create return in Shopify.";
-    console.error("Return userErrors:", result.errors);
-    return sendJson(res, 400, { ok: false, error: errorMsg });
+    return sendJson(res, 400, {
+      ok: false,
+      error: result.errors?.[0]?.message || "Unable to create the return.",
+    });
   }
-
-  console.log("Return created successfully:", result.returnData);
 
   try {
     await sendMerchantNotification({
       order,
       returnData: result.returnData,
       items: enrichedItems,
+      autoApproved: result.autoApproved,
     });
-  } catch (err) {
-    console.error("Merchant notification error:", err);
+  } catch (error) {
+    // Email failure must not invalidate an already-created return.
+    console.error("Merchant notification error:", error);
   }
 
   return sendJson(res, 200, {
@@ -1011,46 +1035,78 @@ async function handleSubmit(res, body) {
     message: result.autoApproved
       ? "Return request submitted and approved. Check your email for return instructions."
       : "Return request submitted. Our team will review it shortly.",
-    reference: result.returnData?.name || orderNumber,
-    returnId: result.returnData?.id,
-    autoApproved: result.autoApproved || false,
+    reference: result.returnData.name || orderNumber,
+    returnId: result.returnData.id,
+    autoApproved: result.autoApproved,
   });
 }
 
-/**
- * ============================================================
- * MAIN HANDLER
- * ============================================================
- */
+/* ============================================================
+   MAIN HANDLER
+   ============================================================ */
 
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
-      return sendJson(res, 405, { ok: false, error: "Method not allowed." });
+
+      return sendJson(res, 405, {
+        ok: false,
+        error: "Method not allowed.",
+      });
     }
 
     const proxy = verifyAppProxyRequest(req);
+
     if (!proxy.valid) {
-      console.warn("Invalid App Proxy request:", proxy.reason);
-      return sendJson(res, 401, { ok: false, error: "Unauthorized." });
+      return sendJson(res, 401, {
+        ok: false,
+        error: "Unauthorized.",
+      });
     }
 
     const body = await readBody(req);
     const intent = body.intent || "lookup";
 
-    console.log("INTENT:", intent);
-
-    if (intent === "submit") {
-      return await handleSubmit(res, body);
+    if (intent !== "lookup" && intent !== "submit") {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Invalid intent.",
+      });
     }
 
-    return await handleLookup(res, body);
+    const orderNumber = normalizeOrderNumber(
+      body.orderNumber || body.order_number
+    );
+    const email = normalizeEmail(body.email);
+
+    if (!orderNumber || orderNumber.length > 50) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Please enter a valid order number.",
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "Please enter a valid email address.",
+      });
+    }
+
+    if (intent === "submit") {
+      return await handleSubmit(res, body, orderNumber, email);
+    }
+
+    return await handleLookup(res, orderNumber, email);
   } catch (error) {
-    console.error("ORDER STATUS ERROR:", error);
-    return sendJson(res, 500, {
+    console.error("RETURN PORTAL ERROR:", error);
+
+    return sendJson(res, error.statusCode || 500, {
       ok: false,
-      error: "An unexpected server error occurred.",
+      error: error.statusCode
+        ? error.message
+        : "An unexpected server error occurred. Please try again.",
     });
   }
 }
